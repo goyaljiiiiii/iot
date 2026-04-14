@@ -1,0 +1,6 @@
+mediapipe==0.10.14
+numpy==2.4.4
+opencv-python==4.13.0.92
+pygame==2.6.1
+pyserial==3.5
+spotipy==2.25.1
