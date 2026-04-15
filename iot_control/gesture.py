@@ -1,4 +1,5 @@
 import glob
+import ast
 import math
 import random
 import os
@@ -347,6 +348,8 @@ def main():
         "SPOTIFY": False,
         "ARDUINO": False,
     }
+    jarvis_distance_scale = 1.0
+    jarvis_height_factor = 1.0
 
     def resolve_ollama_binary():
         candidates = [
@@ -435,6 +438,53 @@ def main():
 
         print(f"TTS unavailable: {text}")
 
+    def count_raised_fingers(landmarks):
+        wrist = landmarks[0]
+        palm_width = max(
+            0.02,
+            math.hypot(landmarks[5].x - landmarks[17].x, landmarks[5].y - landmarks[17].y),
+        )
+
+        palm_center_x = (landmarks[0].x + landmarks[5].x + landmarks[9].x + landmarks[13].x + landmarks[17].x) / 5.0
+        palm_center_y = (landmarks[0].y + landmarks[5].y + landmarks[9].y + landmarks[13].y + landmarks[17].y) / 5.0
+
+        def dist_from_palm(idx):
+            return math.hypot(landmarks[idx].x - palm_center_x, landmarks[idx].y - palm_center_y)
+
+        def dist_from_wrist(idx):
+            return math.hypot(landmarks[idx].x - wrist.x, landmarks[idx].y - wrist.y)
+
+        def joint_angle(a_idx, b_idx, c_idx):
+            ax, ay = landmarks[a_idx].x, landmarks[a_idx].y
+            bx, by = landmarks[b_idx].x, landmarks[b_idx].y
+            cx, cy = landmarks[c_idx].x, landmarks[c_idx].y
+
+            v1x, v1y = ax - bx, ay - by
+            v2x, v2y = cx - bx, cy - by
+            n1 = math.hypot(v1x, v1y)
+            n2 = math.hypot(v2x, v2y)
+            if n1 < 1e-6 or n2 < 1e-6:
+                return 0.0
+            cosang = max(-1.0, min(1.0, (v1x * v2x + v1y * v2y) / (n1 * n2)))
+            return math.degrees(math.acos(cosang))
+
+        # Thumb extension from palm-radial distance + uncurled angle.
+        thumb_tip_far = dist_from_palm(4) > dist_from_palm(3) + 0.12 * palm_width
+        thumb_uncurled = joint_angle(2, 3, 4) > 145
+        thumb_extended = thumb_tip_far and thumb_uncurled
+
+        count = 1 if thumb_extended else 0
+
+        # Non-thumb fingers: orientation-agnostic using radial + wrist distance, with y-check as bonus.
+        for tip, pip, mcp in [(8, 6, 5), (12, 10, 9), (16, 14, 13), (20, 18, 17)]:
+            radial_extended = dist_from_palm(tip) > dist_from_palm(pip) + 0.08 * palm_width
+            wrist_extended = dist_from_wrist(tip) > dist_from_wrist(mcp) + 0.10 * palm_width
+            vertical_extended = landmarks[tip].y < landmarks[pip].y
+            if (radial_extended and wrist_extended) or vertical_extended:
+                count += 1
+
+        return count
+
     def send_arduino(command):
         nonlocal last_sent
 
@@ -507,6 +557,112 @@ def main():
     def chat_reply(user_text):
         nonlocal voice_chat_history
 
+        def safe_eval_math(expression):
+            try:
+                node = ast.parse(expression, mode="eval")
+            except Exception:
+                return None
+
+            allowed_binops = {
+                ast.Add: lambda a, b: a + b,
+                ast.Sub: lambda a, b: a - b,
+                ast.Mult: lambda a, b: a * b,
+                ast.Div: lambda a, b: a / b,
+                ast.Mod: lambda a, b: a % b,
+                ast.Pow: lambda a, b: a**b,
+            }
+            allowed_unary = {
+                ast.UAdd: lambda a: +a,
+                ast.USub: lambda a: -a,
+            }
+
+            def _eval(n):
+                if isinstance(n, ast.Expression):
+                    return _eval(n.body)
+
+                if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+                    return float(n.value)
+
+                if isinstance(n, ast.UnaryOp) and type(n.op) in allowed_unary:
+                    return allowed_unary[type(n.op)](_eval(n.operand))
+
+                if isinstance(n, ast.BinOp) and type(n.op) in allowed_binops:
+                    left = _eval(n.left)
+                    right = _eval(n.right)
+                    if isinstance(n.op, ast.Pow) and abs(right) > 8:
+                        raise ValueError("Exponent too large")
+                    return allowed_binops[type(n.op)](left, right)
+
+                raise ValueError("Unsupported expression")
+
+            try:
+                result = _eval(node)
+                if math.isinf(result) or math.isnan(result):
+                    return None
+                return result
+            except Exception:
+                return None
+
+        def try_math_reply(text):
+            lowered = text.lower()
+            lowered = lowered.replace("x", " * ")
+            replacements = {
+                "plus": " + ",
+                "minus": " - ",
+                "times": " * ",
+                "multiplied by": " * ",
+                "into": " * ",
+                "divided by": " / ",
+                "over": " / ",
+                "modulus": " % ",
+                "mod": " % ",
+                "to the power of": " ** ",
+                "power": " ** ",
+            }
+            for src, dst in replacements.items():
+                lowered = lowered.replace(src, dst)
+
+            number_words = {
+                "zero": "0",
+                "one": "1",
+                "two": "2",
+                "three": "3",
+                "four": "4",
+                "five": "5",
+                "six": "6",
+                "seven": "7",
+                "eight": "8",
+                "nine": "9",
+                "ten": "10",
+                "eleven": "11",
+                "twelve": "12",
+                "thirteen": "13",
+                "fourteen": "14",
+                "fifteen": "15",
+                "sixteen": "16",
+                "seventeen": "17",
+                "eighteen": "18",
+                "nineteen": "19",
+                "twenty": "20",
+            }
+            for word, num in number_words.items():
+                lowered = re.sub(rf"\b{word}\b", num, lowered)
+
+            lowered = re.sub(r"\b(what is|what's|calculate|compute|solve|equals|equal to|answer)\b", " ", lowered)
+            lowered = re.sub(r"[^0-9\+\-\*\/\%\(\)\.\s]", " ", lowered)
+            lowered = " ".join(lowered.split())
+
+            if not re.search(r"[\+\-\*\/\%]", lowered):
+                return None
+
+            result = safe_eval_math(lowered)
+            if result is None:
+                return None
+
+            if abs(result - round(result)) < 1e-9:
+                return f"The answer is {int(round(result))}."
+            return f"The answer is {result:.4f}."
+
         def extract_city(text):
             match = re.search(r"\bin\s+([a-zA-Z\s]{2,40})", text)
             if not match:
@@ -552,6 +708,59 @@ def main():
             except Exception as exc:
                 print(f"Weather fetch error: {exc}")
                 return "Live weather data is currently unavailable."
+
+        def local_fallback_reply(raw_text, lowered_text, weather_text):
+            now_dt = datetime.now()
+
+            math_reply = try_math_reply(raw_text)
+            if math_reply:
+                return math_reply
+
+            if weather_text:
+                return weather_text
+
+            if any(word in lowered_text for word in ["hello", "hi", "hey", "yo"]):
+                return "Hello. I am online and listening."
+
+            if any(word in lowered_text for word in ["thanks", "thank you", "thx"]):
+                return "You are welcome."
+
+            if any(phrase in lowered_text for phrase in ["how are you", "how are u", "what's up", "whats up"]):
+                return "I am running well and ready to help."
+
+            if any(phrase in lowered_text for phrase in ["who are you", "what are you", "your name", "who is this"]):
+                return "I am JARVIS, your IoT and voice assistant."
+
+            if any(phrase in lowered_text for phrase in ["what time", "current time", "time now"]):
+                return f"Current time is {now_dt.strftime('%I:%M %p')}"
+
+            if any(phrase in lowered_text for phrase in ["what date", "today date", "which date", "today is"]):
+                return f"Today is {now_dt.strftime('%A, %d %B %Y')}"
+
+            if any(phrase in lowered_text for phrase in ["what can you do", "help", "commands", "capabilities"]):
+                return (
+                    "I can control Spotify, switch I O T and Spotify modes, adjust volume, "
+                    "and answer short questions."
+                )
+
+            if any(phrase in lowered_text for phrase in ["status", "system status", "are you online"]):
+                return f"Mode is {current_mode}. Voice is {'on' if voice_enabled else 'off'}."
+
+            if lowered_text.endswith("?"):
+                topic_words = [
+                    word
+                    for word in re.findall(r"[a-zA-Z]{3,}", raw_text.lower())
+                    if word not in {"what", "when", "where", "which", "who", "how", "why", "can", "you", "the"}
+                ]
+                if topic_words:
+                    topic = topic_words[0]
+                    return (
+                        f"I heard your question about {topic}. "
+                        "I can give short answers and also run voice commands for music and I O T."
+                    )
+                return "Good question. I can answer short queries and execute your voice commands."
+
+            return "I am listening. You can ask a question or give a command."
 
         local_base = os.getenv("AI_LOCAL_API_BASE", "http://127.0.0.1:11434")
         local_model = os.getenv("AI_LOCAL_MODEL", "llama3.2:3b")
@@ -632,17 +841,7 @@ def main():
                 print(f"Voice chat API error: {exc}")
 
         lower = user_text.lower().strip()
-        if any(phrase in lower for phrase in ["how are you", "how are u", "what's up", "whats up"]):
-            return "I am ready and listening."
-        if any(phrase in lower for phrase in ["who are you", "what are you"]):
-            return "I am JARVIS, your voice assistant."
-        if any(phrase in lower for phrase in ["your name", "who am i talking", "who is this"]):
-            return "I am JARVIS, your AI assistant."
-        if weather_info:
-            return weather_info
-        if lower.endswith("?"):
-            return "I can answer that. If my local model is offline, I may give shorter fallback replies."
-        return "I am here. Ask me anything or give a command."
+        return local_fallback_reply(user_text, lower, weather_info)
 
     def handle_voice_wake():
         reply("Yes?")
@@ -757,12 +956,21 @@ def main():
 
         reply(chat_reply(command))
 
+    voice_phrase_seconds = float(os.getenv("VOICE_PHRASE_SECONDS", "4.0"))
+    voice_cooldown_seconds = float(os.getenv("VOICE_COOLDOWN_SECONDS", "0.35"))
+    voice_suppress_seconds = float(os.getenv("VOICE_SUPPRESS_SECONDS", "1.2"))
+    voice_wake_window_seconds = float(os.getenv("VOICE_WAKE_WINDOW_SECONDS", "8.0"))
+
     voice_listener = VoiceCommandListener(
         on_command=handle_voice_command,
         on_wake=handle_voice_wake,
         on_heard=handle_voice_heard,
         on_state=handle_voice_state,
         on_error=lambda message: print(message),
+        phrase_seconds=voice_phrase_seconds,
+        cooldown_seconds=voice_cooldown_seconds,
+        callback_suppress_seconds=voice_suppress_seconds,
+        wake_window_seconds=voice_wake_window_seconds,
         require_wake_word=False,
     )
     voice_listener.start()
@@ -799,36 +1007,80 @@ def main():
 
         detected_count = None
         pinch_detected = False
-        wrist = None
+        palm_center = None
         jarvis_angle = 0
+        jarvis_render_targets = []
 
         if results.multi_hand_landmarks:
+            for hl_all in results.multi_hand_landmarks:
+                mp_draw.draw_landmarks(frame, hl_all, mp_hands.HAND_CONNECTIONS)
+                lm_all = hl_all.landmark
+
+                detected_count_all = count_raised_fingers(lm_all)
+
+                if current_mode == "IOT" and not voice_enabled and detected_count_all == 5:
+                    palm_points_all = [0, 1, 5, 9, 13, 17]
+                    base_center_x_all = sum(lm_all[idx].x for idx in palm_points_all) / len(palm_points_all)
+                    base_center_y_all = sum(lm_all[idx].y for idx in palm_points_all) / len(palm_points_all)
+                    dir_x_all = lm_all[9].x - lm_all[0].x
+                    dir_y_all = lm_all[9].y - lm_all[0].y
+                    lift_factor_all = 0.34
+                    palm_center_all = (
+                        int((base_center_x_all + dir_x_all * lift_factor_all) * w),
+                        int((base_center_y_all + dir_y_all * lift_factor_all) * h),
+                    )
+                    index_base_all = (int(lm_all[5].x * w), int(lm_all[5].y * h))
+                    dx_all = index_base_all[0] - palm_center_all[0]
+                    dy_all = index_base_all[1] - palm_center_all[1]
+                    jarvis_angle_all = math.degrees(math.atan2(dy_all, dx_all)) + 90
+                    hand_ys_all = [point.y for point in lm_all]
+                    hand_height_all = max(0.06, max(hand_ys_all) - min(hand_ys_all))
+                    per_hand_scale = max(0.82, min(1.28, 0.76 + hand_height_all * 1.4))
+                    per_hand_height = max(0.0, min(1.0, 1.0 - (palm_center_all[1] / max(1, h))))
+                    fingertip_points_all = [
+                        (int(lm_all[idx].x * w), int(lm_all[idx].y * h))
+                        for idx in (4, 8, 12, 16, 20)
+                    ]
+                    jarvis_render_targets.append(
+                        (palm_center_all, jarvis_angle_all, per_hand_scale, per_hand_height, fingertip_points_all)
+                    )
+
             hl = results.multi_hand_landmarks[0]
-            mp_draw.draw_landmarks(frame, hl, mp_hands.HAND_CONNECTIONS)
             lm = hl.landmark
 
-            fingers = []
-            if lm[4].x > lm[3].x:
-                fingers.append(1)
-
-            for tip, pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
-                if lm[tip].y < lm[pip].y:
-                    fingers.append(1)
-
-            detected_count = len(fingers)
+            detected_count = count_raised_fingers(lm)
 
             cx, cy = int(lm[8].x * w), int(lm[8].y * h)
             tx, ty = int(lm[4].x * w), int(lm[4].y * h)
             pinch_dist = math.hypot(cx - tx, cy - ty)
             pinch_detected = pinch_dist < 45 and detected_count <= 2
 
-            wrist = (
-                int((lm[0].x + lm[9].x) / 2 * w),
-                int((lm[0].y + lm[9].y) / 2 * h),
+            palm_points = [0, 1, 5, 9, 13, 17]
+            base_center_x = sum(lm[idx].x for idx in palm_points) / len(palm_points)
+            base_center_y = sum(lm[idx].y for idx in palm_points) / len(palm_points)
+
+            # Lift effect anchor toward fingers using hand direction (wrist -> middle MCP).
+            dir_x = lm[9].x - lm[0].x
+            dir_y = lm[9].y - lm[0].y
+            lift_factor = 0.34
+            palm_center = (
+                int((base_center_x + dir_x * lift_factor) * w),
+                int((base_center_y + dir_y * lift_factor) * h),
             )
+
+            hand_xs = [point.x for point in lm]
+            hand_ys = [point.y for point in lm]
+            hand_height_norm = max(0.06, max(hand_ys) - min(hand_ys))
+            target_distance_scale = max(0.82, min(1.25, 0.76 + hand_height_norm * 1.35))
+            jarvis_distance_scale = 0.84 * jarvis_distance_scale + 0.16 * target_distance_scale
+
+            palm_height_norm = max(0.0, min(1.0, 1.0 - (palm_center[1] / max(1, h))))
+            target_height_factor = 0.90 + 0.26 * palm_height_norm
+            jarvis_height_factor = 0.86 * jarvis_height_factor + 0.14 * target_height_factor
+
             index_base = (int(lm[5].x * w), int(lm[5].y * h))
-            dx = index_base[0] - wrist[0]
-            dy = index_base[1] - wrist[1]
+            dx = index_base[0] - palm_center[0]
+            dy = index_base[1] - palm_center[1]
             jarvis_angle = math.degrees(math.atan2(dy, dx)) + 90
 
             if current_mode == "IOT" and not voice_enabled:
@@ -970,6 +1222,9 @@ def main():
         else:
             spotify_trigger_time = 0
 
+        if current_mode == "IOT" and not voice_enabled:
+            jarvis_active = bool(jarvis_render_targets)
+
         if gesture_name != "FIST":
             fist_start_time = 0
             try:
@@ -978,48 +1233,354 @@ def main():
             except Exception:
                 pass
 
-        if current_mode == "IOT" and jarvis_active and wrist is not None:
-            center = wrist
-            jarvis_blue = (255, 255, 0)
+        if current_mode == "IOT" and jarvis_active and jarvis_render_targets:
+            sorted_targets = sorted(jarvis_render_targets, key=lambda item: item[0][0])
 
-            cv2.circle(frame, center, 170, (60, 60, 60), 1)
-            cv2.circle(frame, center, 150, (90, 90, 90), 2)
-            cv2.circle(frame, center, 130, jarvis_blue, 2)
+            if len(sorted_targets) >= 2:
+                left_center = sorted_targets[0][0]
+                right_center = sorted_targets[1][0]
+                bridge_overlay = frame.copy()
+                bridge_len = max(1.0, math.hypot(right_center[0] - left_center[0], right_center[1] - left_center[1]))
+                bridge_strength = max(0.2, min(1.0, bridge_len / max(1, w * 0.62)))
+                bridge_phase = time.time() * 6.0
 
-            for i in range(0, 360, 12):
-                angle = math.radians(i + jarvis_angle * 0.4)
-                x1 = int(center[0] + 120 * math.cos(angle))
-                y1 = int(center[1] + 120 * math.sin(angle))
-                x2 = int(center[0] + 150 * math.cos(angle))
-                y2 = int(center[1] + 150 * math.sin(angle))
-                cv2.line(frame, (x1, y1), (x2, y2), (80, 80, 80), 1)
+                for strand in range(4):
+                    wave = int((strand - 1.5) * 4 + 8 * math.sin(bridge_phase + strand * 1.1))
+                    p1 = (left_center[0], left_center[1] + wave)
+                    p2 = (right_center[0], right_center[1] - wave)
+                    strand_color = (int(120 + 40 * strand), int(150 + 12 * strand), int(220 - 15 * strand))
+                    cv2.line(bridge_overlay, p1, p2, strand_color, 1 + (strand % 2))
 
-            cv2.ellipse(frame, center, (110, 110), jarvis_angle, 0, 360, jarvis_blue, 2)
-            cv2.ellipse(frame, center, (90, 90), -jarvis_angle * 1.2, 0, 300, (180, 180, 180), 1)
-            cv2.ellipse(frame, center, (70, 70), jarvis_angle * 1.6, 90, 360, jarvis_blue, 2)
+                # Dual-hand reactor tunnel ring pulses between palms.
+                link_mid = (
+                    (left_center[0] + right_center[0]) // 2,
+                    (left_center[1] + right_center[1]) // 2,
+                )
+                for n in range(3):
+                    wave_r = int(22 + n * 16 + 6 * math.sin(bridge_phase + n * 1.3))
+                    cv2.ellipse(
+                        bridge_overlay,
+                        link_mid,
+                        (wave_r, int(max(10, wave_r * 0.42))),
+                        math.degrees(math.atan2(right_center[1] - left_center[1], right_center[0] - left_center[0])),
+                        0,
+                        360,
+                        (110 + n * 30, 175 + n * 18, 245),
+                        1,
+                    )
 
-            cv2.circle(frame, center, 45, jarvis_blue, 3)
-            cv2.circle(frame, center, 25, (255, 255, 255), -1)
+                steps = 10
+                for step in range(1, steps):
+                    blend = step / steps
+                    px = int(left_center[0] * (1 - blend) + right_center[0] * blend)
+                    py = int(left_center[1] * (1 - blend) + right_center[1] * blend)
+                    sparkle = int(2 + 2 * math.sin(time.time() * 10 + step))
+                    cv2.circle(bridge_overlay, (px, py), max(1, sparkle), (255, 240, 180), -1)
 
-            for i in range(8):
-                ang = math.radians(jarvis_angle * 2 + i * 45)
-                x = int(center[0] + 120 * math.cos(ang))
-                y = int(center[1] + 120 * math.sin(ang))
-                cv2.circle(frame, (x, y), 5, jarvis_blue, -1)
+                cv2.addWeighted(bridge_overlay, 0.28 + 0.12 * bridge_strength, frame, 0.72 - 0.12 * bridge_strength, 0, frame)
 
-            hex_pts = []
-            for i in range(6):
-                ang = math.radians(i * 60 + jarvis_angle)
-                x = int(center[0] + 30 * math.cos(ang))
-                y = int(center[1] + 30 * math.sin(ang))
-                hex_pts.append([x, y])
+            for idx, (center, render_angle, per_hand_scale, per_hand_height, fingertip_points) in enumerate(sorted_targets):
+                t = time.time()
+                phase = idx * 0.42
+                global_scale = jarvis_distance_scale * (0.90 + 0.22 * jarvis_height_factor)
+                hand_scale = per_hand_scale * (0.90 + 0.22 * (0.90 + 0.26 * per_hand_height))
+                blended_scale = 0.55 * global_scale + 0.45 * hand_scale
+                dynamic_scale = max(0.76, min(1.36, blended_scale))
+                pulse_rate = 3.0 + (dynamic_scale - 1.0) * 2.1
+                sweep_speed = 88 + (dynamic_scale - 1.0) * 74 + (jarvis_height_factor - 1.0) * 35
+                pulse = 0.72 + 0.28 * (0.5 + 0.5 * math.sin((t + phase) * pulse_rate))
+                sweep = ((render_angle + phase * 32) * 1.8 + t * sweep_speed) % 360
+                twinkle = 0.5 + 0.5 * math.sin((t + phase) * 8.2)
 
-            cv2.polylines(frame, [np.array(hex_pts, np.int32)], True, jarvis_blue, 2)
+                if idx % 2 == 0:
+                    neon_core = (255, 220, 60)
+                    neon_ring = (255, 200, 70)
+                    neon_soft = (170, 120, 35)
+                    steel = (95, 105, 120)
+                else:
+                    neon_core = (120, 245, 255)
+                    neon_ring = (95, 225, 255)
+                    neon_soft = (52, 128, 160)
+                    steel = (95, 120, 138)
 
-            cv2.line(frame, (center[0] - 40, center[1]), (center[0] - 90, center[1]), jarvis_blue, 2)
-            cv2.line(frame, (center[0] + 40, center[1]), (center[0] + 90, center[1]), jarvis_blue, 2)
-            cv2.line(frame, (center[0], center[1] - 40), (center[0], center[1] - 90), jarvis_blue, 2)
-            cv2.line(frame, (center[0], center[1] + 40), (center[0], center[1] + 90), jarvis_blue, 2)
+                glow = frame.copy()
+                max_r = int((146 + 8 * pulse) * dynamic_scale)
+                for radius, color, thickness in [
+                    (max_r, (40, 55, 85), -1),
+                    (int(max_r * 0.78), (28, 42, 64), -1),
+                    (int(max_r * 0.54), (20, 30, 46), -1),
+                ]:
+                    cv2.circle(glow, center, radius, color, thickness)
+                cv2.addWeighted(glow, 0.36, frame, 0.64, 0, frame)
+
+                outer_r = int((130 + 5 * pulse) * dynamic_scale)
+                mid_r = int((106 + 4 * pulse) * dynamic_scale)
+                inner_r = int((78 + 3 * pulse) * dynamic_scale)
+
+                cv2.circle(frame, center, outer_r, steel, 1)
+                cv2.circle(frame, center, mid_r, (120, 140, 170) if idx % 2 == 0 else (130, 180, 215), 2)
+                cv2.circle(frame, center, inner_r, neon_soft, 1)
+
+                # Soft crosshair bloom at center.
+                bloom_len = int((62 + 5 * pulse) * dynamic_scale)
+                cv2.line(
+                    frame,
+                    (center[0] - bloom_len, center[1]),
+                    (center[0] + bloom_len, center[1]),
+                    (120, 110, 85),
+                    1,
+                )
+                cv2.line(
+                    frame,
+                    (center[0], center[1] - bloom_len),
+                    (center[0], center[1] + bloom_len),
+                    (120, 110, 85),
+                    1,
+                )
+
+                for i in range(0, 360, 10):
+                    ang = math.radians(i + sweep * 0.35)
+                    x1 = int(center[0] + (inner_r + 8) * math.cos(ang))
+                    y1 = int(center[1] + (inner_r + 8) * math.sin(ang))
+                    x2 = int(center[0] + (mid_r - 8) * math.cos(ang))
+                    y2 = int(center[1] + (mid_r - 8) * math.sin(ang))
+                    cv2.line(frame, (x1, y1), (x2, y2), (95, 105, 122), 1)
+
+                # Rotating segmented arcs for a more premium scanner look.
+                arc_sets = [
+                    (outer_r - 10, sweep, 58, neon_ring, 2),
+                    (outer_r - 10, sweep + 165, 42, (200, 165, 65) if idx % 2 == 0 else (115, 195, 230), 2),
+                    (mid_r - 8, -sweep * 1.2, 68, neon_core, 2),
+                    (mid_r - 8, -sweep * 1.2 + 205, 34, (190, 145, 55) if idx % 2 == 0 else (90, 170, 210), 2),
+                    (inner_r - 8, sweep * 1.6, 85, (255, 235, 120) if idx % 2 == 0 else (175, 245, 255), 2),
+                ]
+                for radius, start, span, color, thick in arc_sets:
+                    cv2.ellipse(frame, center, (radius, radius), 0, start, start + span, color, thick)
+
+                # Add layered cinematic rings for arc-reactor style depth.
+                cv2.ellipse(
+                    frame,
+                    center,
+                    (outer_r - 22, outer_r - 22),
+                    sweep * 0.45,
+                    30,
+                    310,
+                    (140, 175, 230) if idx % 2 == 0 else (120, 220, 255),
+                    1,
+                )
+                cv2.ellipse(
+                    frame,
+                    center,
+                    (mid_r - 18, mid_r - 18),
+                    -sweep * 0.75,
+                    0,
+                    260,
+                    (255, 210, 110) if idx % 2 == 0 else (135, 230, 255),
+                    1,
+                )
+                cv2.ellipse(
+                    frame,
+                    center,
+                    (inner_r - 14, inner_r - 14),
+                    sweep * 1.2,
+                    80,
+                    360,
+                    (255, 240, 150) if idx % 2 == 0 else (190, 250, 255),
+                    1,
+                )
+
+                # Orbiting glints for depth.
+                glint_r = mid_r + 6
+                for offset in (0, 120, 240):
+                    ang = math.radians(sweep * 1.25 + offset)
+                    gx = int(center[0] + glint_r * math.cos(ang))
+                    gy = int(center[1] + glint_r * math.sin(ang))
+                    glow_size = 3 if (offset == 0 and twinkle > 0.65) else 2
+                    cv2.circle(frame, (gx, gy), glow_size, (255, 235, 150) if idx % 2 == 0 else (190, 245, 255), -1)
+
+                # Sweep beam accent.
+                beam_ang = math.radians(sweep)
+                bx = int(center[0] + (outer_r - 14) * math.cos(beam_ang))
+                by = int(center[1] + (outer_r - 14) * math.sin(beam_ang))
+                cv2.line(frame, center, (bx, by), (255, 230, 120) if idx % 2 == 0 else (150, 240, 255), 2)
+                cv2.circle(frame, (bx, by), 5, (255, 235, 145) if idx % 2 == 0 else (205, 250, 255), -1)
+
+                # Beam trail for more cinematic motion.
+                for trail_idx in range(1, 4):
+                    trail_ang = math.radians(sweep - trail_idx * 8)
+                    tx = int(center[0] + (outer_r - 18 - trail_idx * 3) * math.cos(trail_ang))
+                    ty = int(center[1] + (outer_r - 18 - trail_idx * 3) * math.sin(trail_ang))
+                    if idx % 2 == 0:
+                        trail_color = (210 - trail_idx * 30, 180 - trail_idx * 20, 110 - trail_idx * 15)
+                    else:
+                        trail_color = (130 - trail_idx * 14, 210 - trail_idx * 22, 235 - trail_idx * 20)
+                    cv2.line(frame, center, (tx, ty), trail_color, 1)
+
+                core_outer = int((39 + 3 * pulse) * dynamic_scale)
+                core_inner = int((18 + 2 * pulse) * dynamic_scale)
+                cv2.circle(frame, center, core_outer, neon_ring, 2)
+                cv2.circle(frame, center, core_inner + 8, (255, 245, 185) if idx % 2 == 0 else (205, 250, 255), -1)
+                cv2.circle(frame, center, core_inner, (255, 255, 255), -1)
+
+                # Inner rotating triangle and braces for a HUD-like look.
+                tri_r = core_inner + 24
+                tri_pts = []
+                for i in range(3):
+                    tri_ang = math.radians(sweep * 1.1 + i * 120)
+                    tri_pts.append(
+                        [
+                            int(center[0] + tri_r * math.cos(tri_ang)),
+                            int(center[1] + tri_r * math.sin(tri_ang)),
+                        ]
+                    )
+                cv2.polylines(frame, [np.array(tri_pts, np.int32)], True, (255, 225, 120) if idx % 2 == 0 else (170, 245, 255), 1)
+
+                brace_r = inner_r - 18
+                for angle_offset in (45, 135, 225, 315):
+                    a = math.radians(angle_offset + sweep * 0.4)
+                    bx1 = int(center[0] + brace_r * math.cos(a))
+                    by1 = int(center[1] + brace_r * math.sin(a))
+                    bx2 = int(center[0] + (brace_r + 10) * math.cos(a))
+                    by2 = int(center[1] + (brace_r + 10) * math.sin(a))
+                    cv2.line(frame, (bx1, by1), (bx2, by2), (210, 175, 90) if idx % 2 == 0 else (120, 210, 245), 2)
+
+                hex_pts = []
+                for i in range(6):
+                    ang = math.radians(i * 60 + sweep * 0.9)
+                    x = int(center[0] + (core_inner + 14) * math.cos(ang))
+                    y = int(center[1] + (core_inner + 14) * math.sin(ang))
+                    hex_pts.append([x, y])
+                cv2.polylines(frame, [np.array(hex_pts, np.int32)], True, (255, 220, 95) if idx % 2 == 0 else (150, 240, 255), 2)
+
+                for i in range(12):
+                    ang = math.radians(i * 30 + sweep * 0.55)
+                    r = outer_r - 2
+                    x = int(center[0] + r * math.cos(ang))
+                    y = int(center[1] + r * math.sin(ang))
+                    size = 2 if i % 2 == 0 else 3
+                    cv2.circle(frame, (x, y), size, (230, 195, 85) if idx % 2 == 0 else (130, 220, 250), -1)
+
+                # Micro particles that shimmer near the outer ring.
+                particle_count = int(6 + 6 * twinkle)
+                for i in range(particle_count):
+                    p_ang = math.radians((sweep * 1.6 + i * (360 / max(1, particle_count))) % 360)
+                    p_r = outer_r + 8 + (i % 3) * 3
+                    px = int(center[0] + p_r * math.cos(p_ang))
+                    py = int(center[1] + p_r * math.sin(p_ang))
+                    cv2.circle(frame, (px, py), 1, (255, 240, 170) if idx % 2 == 0 else (190, 248, 255), -1)
+
+                # Cinematic wave shell and rotating chevrons.
+                shell_overlay = frame.copy()
+                shell_r = outer_r + 18
+                for band in range(3):
+                    start_ang = (sweep * (1.2 + band * 0.18) + band * 80) % 360
+                    span = 52 + band * 16
+                    shell_color = (145 + band * 30, 170 + band * 18, 245 - band * 20) if idx % 2 else (250 - band * 22, 205 - band * 14, 120 - band * 12)
+                    cv2.ellipse(shell_overlay, center, (shell_r + band * 8, shell_r + band * 8), 0, start_ang, start_ang + span, shell_color, 2)
+                cv2.addWeighted(shell_overlay, 0.20, frame, 0.80, 0, frame)
+
+                for k in range(8):
+                    ang = math.radians((sweep * 0.9 + k * 45) % 360)
+                    base_r = inner_r + 18
+                    p1 = (
+                        int(center[0] + base_r * math.cos(ang)),
+                        int(center[1] + base_r * math.sin(ang)),
+                    )
+                    p2 = (
+                        int(center[0] + (base_r + 12) * math.cos(ang + 0.08)),
+                        int(center[1] + (base_r + 12) * math.sin(ang + 0.08)),
+                    )
+                    p3 = (
+                        int(center[0] + (base_r + 12) * math.cos(ang - 0.08)),
+                        int(center[1] + (base_r + 12) * math.sin(ang - 0.08)),
+                    )
+                    cv2.polylines(frame, [np.array([p1, p2, p3], np.int32)], True, (245, 220, 140) if idx % 2 == 0 else (170, 245, 255), 1)
+
+                # Radial flicker lines to amplify reactor energy.
+                for ray in range(16):
+                    a = math.radians(ray * 22.5 + sweep * 0.55)
+                    r1 = core_inner + 6
+                    r2 = inner_r - 6
+                    rx1 = int(center[0] + r1 * math.cos(a))
+                    ry1 = int(center[1] + r1 * math.sin(a))
+                    rx2 = int(center[0] + r2 * math.cos(a))
+                    ry2 = int(center[1] + r2 * math.sin(a))
+                    if ray % 2 == 0:
+                        cv2.line(frame, (rx1, ry1), (rx2, ry2), (180, 175, 130) if idx % 2 == 0 else (140, 210, 230), 1)
+
+                # Trailing afterimage for faster perceived motion.
+                trail_overlay = frame.copy()
+                for trail in range(1, 4):
+                    ta = math.radians(sweep - trail * 14)
+                    tr = outer_r - 24
+                    tx = int(center[0] + tr * math.cos(ta))
+                    ty = int(center[1] + tr * math.sin(ta))
+                    cv2.circle(trail_overlay, (tx, ty), max(2, 6 - trail), (255, 230, 150) if idx % 2 == 0 else (180, 245, 255), -1)
+                cv2.addWeighted(trail_overlay, 0.18, frame, 0.82, 0, frame)
+
+                # Finger energy threads that stretch with palm-to-fingertip distance.
+                thread_overlay = frame.copy()
+                for finger_i, tip_pt in enumerate(fingertip_points):
+                    dx_tip = tip_pt[0] - center[0]
+                    dy_tip = tip_pt[1] - center[1]
+                    finger_dist = max(1.0, math.hypot(dx_tip, dy_tip))
+                    dist_norm = max(0.0, min(1.0, finger_dist / max(1.0, 0.40 * h)))
+                    # More stretch -> stronger displacement and brighter strands.
+                    stretch_amp = 4 + 9 * dist_norm
+
+                    angle = math.atan2(dy_tip, dx_tip)
+                    perp_x = -math.sin(angle)
+                    perp_y = math.cos(angle)
+                    phase_base = t * (8.0 + finger_i * 0.65) + finger_i * 0.9 + phase
+
+                    points = []
+                    segments = 13
+                    for s in range(segments + 1):
+                        u = s / segments
+                        bx = center[0] + dx_tip * u
+                        by = center[1] + dy_tip * u
+                        # Taper wave near center and tip for cleaner anchors.
+                        envelope = math.sin(math.pi * u)
+                        wave = math.sin(phase_base + u * 9.5) * stretch_amp * envelope
+                        px = int(bx + perp_x * wave)
+                        py = int(by + perp_y * wave)
+                        points.append([px, py])
+
+                    thread_color = (255, 220, 120) if idx % 2 == 0 else (160, 245, 255)
+                    glow_color = (210, 175, 90) if idx % 2 == 0 else (115, 205, 240)
+                    cv2.polylines(thread_overlay, [np.array(points, np.int32)], False, glow_color, 3)
+                    cv2.polylines(thread_overlay, [np.array(points, np.int32)], False, thread_color, 1)
+
+                    # Moving plasma pulses along each thread.
+                    pulse_u = (0.12 * finger_i + (t * 0.85) % 1.0)
+                    pulse_idx = max(0, min(len(points) - 1, int(pulse_u * (len(points) - 1))))
+                    pulse_pt = points[pulse_idx]
+                    pulse_size = int(2 + 3 * dist_norm)
+                    cv2.circle(thread_overlay, tuple(pulse_pt), pulse_size, (255, 245, 190), -1)
+
+                    # Anchor spark at fingertip.
+                    cv2.circle(thread_overlay, tip_pt, int(2 + 2 * dist_norm), thread_color, -1)
+
+                cv2.addWeighted(thread_overlay, 0.34, frame, 0.66, 0, frame)
+
+                cv2.putText(
+                    frame,
+                    "JARVIS",
+                    (center[0] - 34, center[1] + outer_r + 22),
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    0.56,
+                    (20, 20, 20),
+                    3,
+                )
+                cv2.putText(
+                    frame,
+                    "JARVIS",
+                    (center[0] - 33, center[1] + outer_r + 21),
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    0.56,
+                    (250, 230, 150),
+                    2,
+                )
 
         if jarvis_active:
             if not is_jarvis_playing:
@@ -1072,29 +1633,53 @@ def main():
             startup_checks = collect_startup_checks()
             startup_checks_last_refresh = now
 
-        cv2.putText(frame, f"MODE: {display_mode} MODE", (20, 40), 1, 2, mode_color, 3)
-        cv2.putText(frame, f"GESTURE: {gesture_name}", (20, 80), 1, 2.4, color, 3)
-        cv2.putText(frame, f"VOICE: {'ON' if voice_enabled else 'OFF'}", (20, 120), 1, 2.0, (255, 255, 0), 2)
-        cv2.putText(frame, f"VOICE STATE: {voice_state}", (20, 160), 1, 1.4, (200, 200, 200), 2)
-        cv2.putText(frame, f"HEARD: {voice_last_heard}", (20, 195), 1, 1.2, (170, 170, 170), 2)
-        cv2.putText(frame, f"VOICE REPLY: {voice_last_command}", (20, 230), 1, 1.2, (200, 200, 200), 2)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 280), (20, 24, 32), -1)
+        cv2.rectangle(overlay, (0, h - 60), (w, h), (16, 20, 28), -1)
+        cv2.addWeighted(overlay, 0.34, frame, 0.66, 0, frame)
 
-        panel_x = max(20, w - 290)
-        panel_y = 20
-        panel_w = 260
-        panel_h = 150
-        cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (35, 35, 35), -1)
-        cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (90, 90, 90), 1)
-        cv2.putText(frame, "STARTUP CHECKS", (panel_x + 10, panel_y + 28), 1, 1.0, (255, 255, 255), 2)
+        cv2.putText(frame, "JARVIS CONTROL HUD", (18, 30), 1, 1.0, (240, 240, 255), 2)
+        cv2.line(frame, (18, 36), (260, 36), (90, 140, 255), 2)
+
+        cv2.putText(frame, f"MODE", (20, 68), 1, 0.9, (165, 190, 240), 2)
+        cv2.putText(frame, f"{display_mode}", (130, 68), 1, 1.1, mode_color, 2)
+
+        cv2.putText(frame, "GESTURE", (20, 102), 1, 0.9, (165, 190, 240), 2)
+        cv2.putText(frame, f"{gesture_name}", (130, 102), 1, 1.1, color, 2)
+
+        voice_color = (0, 220, 110) if voice_enabled else (0, 150, 220)
+        cv2.putText(frame, "VOICE", (20, 136), 1, 0.9, (165, 190, 240), 2)
+        cv2.putText(frame, "ON" if voice_enabled else "OFF", (130, 136), 1, 1.1, voice_color, 2)
+
+        cv2.putText(frame, "STATE", (20, 170), 1, 0.9, (165, 190, 240), 2)
+        cv2.putText(frame, f"{voice_state}", (130, 170), 1, 0.95, (210, 210, 210), 2)
+
+        cv2.putText(frame, "HEARD", (20, 204), 1, 0.9, (165, 190, 240), 2)
+        cv2.putText(frame, f"{voice_last_heard[:44]}", (130, 204), 1, 0.9, (190, 190, 190), 2)
+
+        cv2.putText(frame, "REPLY", (20, 238), 1, 0.9, (165, 190, 240), 2)
+        cv2.putText(frame, f"{voice_last_command[:48]}", (130, 238), 1, 0.9, (210, 210, 210), 2)
+
+        panel_x = max(20, w - 306)
+        panel_y = 18
+        panel_w = 286
+        panel_h = 168
+        cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (22, 28, 38), -1)
+        cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (88, 116, 170), 1)
+        cv2.putText(frame, "SYSTEM CHECKS", (panel_x + 12, panel_y + 28), 1, 1.0, (240, 240, 255), 2)
 
         check_items = ["MIC", "OLLAMA", "SPOTIFY", "ARDUINO"]
         for index, key in enumerate(check_items):
             ok = bool(startup_checks.get(key))
             label = "OK" if ok else "MISSING"
             status_color = (0, 220, 0) if ok else (0, 0, 255)
-            y = panel_y + 56 + index * 22
-            cv2.putText(frame, f"{key}:", (panel_x + 10, y), 1, 0.9, (220, 220, 220), 2)
-            cv2.putText(frame, label, (panel_x + 145, y), 1, 0.9, status_color, 2)
+            y = panel_y + 56 + index * 25
+            cv2.putText(frame, f"{key}", (panel_x + 14, y), 1, 0.9, (220, 220, 220), 2)
+            cv2.putText(frame, ":", (panel_x + 124, y), 1, 0.9, (140, 140, 140), 2)
+            cv2.putText(frame, label, (panel_x + 150, y), 1, 0.9, status_color, 2)
+
+        bottom_hint = "Press V: Voice Toggle   Esc: Exit"
+        cv2.putText(frame, bottom_hint, (18, h - 22), 1, 0.8, (185, 200, 240), 2)
 
         if switch_countdown is not None and current_mode == "IOT":
             cv2.putText(frame, "Switching...", (w // 2 - 170, h // 2 - 30), 1, 2.2, (0, 200, 255), 4)

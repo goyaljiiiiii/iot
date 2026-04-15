@@ -16,10 +16,10 @@ class VoiceCommandListener:
         on_state=None,
         on_error=None,
         sample_rate=16000,
-        phrase_seconds=2.0,
+        phrase_seconds=4.0,
         cooldown_seconds=0.25,
         wake_word="jarvis",
-        wake_window_seconds=6.0,
+        wake_window_seconds=8.0,
         callback_suppress_seconds=1.2,
         require_wake_word=False,
     ):
@@ -106,10 +106,11 @@ class VoiceCommandListener:
 
                         if remaining:
                             self.on_command(remaining)
+                            self._suppress_until = time.time() + self.callback_suppress_seconds
                         else:
                             self.on_wake()
-
-                        self._suppress_until = time.time() + self.callback_suppress_seconds
+                            # Do not suppress after wake-only phrase; user usually continues speaking immediately.
+                            self._suppress_until = 0.0
                         continue
 
                     if not self.require_wake_word:
