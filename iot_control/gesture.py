@@ -1,20 +1,25 @@
 import glob
 import math
 import random
+import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import warnings
 from pathlib import Path
+from datetime import datetime
 
 import cv2
 import mediapipe as mp
 import numpy as np
 import pygame
+import requests
 import serial
 
 from iot_control.spotify import create_spotify_client
+from iot_control.voice import VoiceCommandListener
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -23,7 +28,7 @@ AUDIO_DIR = ROOT_DIR / "audios"
 
 warnings.filterwarnings(
     "ignore",
-    message="SymbolDatabase.GetPrototype\(\) is deprecated",
+    message=r"SymbolDatabase.GetPrototype\(\) is deprecated",
     category=UserWarning,
 )
 
@@ -241,9 +246,10 @@ def main():
             )
             if result.returncode == 0:
                 print("System Mute toggled")
-                return
+                return True
 
         print("Mute toggle requires pactl on this setup.")
+        return False
 
     sound_count = load_sound("count.mp3")
     sound_click = load_sound("click.mp3")
@@ -276,6 +282,73 @@ def main():
     last_spotify_gesture = None
     must_release_fist_after_spotify = False
     spotify_launch_attempted = False
+    voice_enabled = False
+    voice_last_command = "VOICE OFF"
+    voice_last_heard = "-"
+    voice_state = "voice_off"
+    voice_listener = None
+    ollama_autostart_attempted = False
+
+    def resolve_ollama_binary():
+        candidates = [
+            shutil.which("ollama"),
+            "/usr/local/bin/ollama",
+            "/usr/bin/ollama",
+        ]
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+        return None
+
+    def ollama_server_available(local_base):
+        try:
+            response = requests.get(f"{local_base.rstrip('/')}/api/tags", timeout=2)
+            return response.ok
+        except Exception:
+            return False
+
+    def ensure_ollama_server_running(local_base):
+        nonlocal ollama_autostart_attempted
+
+        auto_start = os.getenv("AI_AUTO_START_OLLAMA", "true").strip().lower()
+        if auto_start not in {"1", "true", "yes", "on"}:
+            return False
+
+        if ollama_server_available(local_base):
+            return True
+
+        if ollama_autostart_attempted:
+            return False
+
+        ollama_autostart_attempted = True
+        binary = resolve_ollama_binary()
+        if not binary:
+            print("Ollama binary not found. Install Ollama or set AI_CHAT_API_KEY.")
+            return False
+
+        try:
+            subprocess.Popen([binary, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(15):
+                if ollama_server_available(local_base):
+                    print("Ollama server started automatically")
+                    return True
+                time.sleep(0.3)
+        except Exception as exc:
+            print(f"Failed to start Ollama server: {exc}")
+
+        print("Ollama server is not reachable.")
+        return False
+
+    def speak(text):
+        if shutil.which("spd-say"):
+            subprocess.Popen(["spd-say", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
+        if shutil.which("espeak"):
+            subprocess.Popen(["espeak", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
+        print(f"TTS unavailable: {text}")
 
     def send_arduino(command):
         nonlocal last_sent
@@ -336,6 +409,256 @@ def main():
         if current_mode == "IOT":
             send_arduino("G")
 
+    def reply(text):
+        nonlocal voice_last_command
+        voice_last_command = text
+        speak(text)
+
+    def chat_reply(user_text):
+        def extract_city(text):
+            match = re.search(r"\bin\s+([a-zA-Z\s]{2,40})", text)
+            if not match:
+                return ""
+            city = " ".join(match.group(1).split()).strip()
+            return city
+
+        def weather_context(text):
+            lowered = text.lower()
+            is_weather_query = any(
+                word in lowered
+                for word in ["weather", "temperature", "rain", "forecast", "hot", "cold", "humidity"]
+            )
+            if not is_weather_query:
+                return ""
+
+            city = extract_city(text)
+            location_path = city.replace(" ", "+") if city else ""
+
+            try:
+                response = requests.get(
+                    f"https://wttr.in/{location_path}?format=j1",
+                    timeout=8,
+                )
+                response.raise_for_status()
+                data = response.json()
+                current = data.get("current_condition", [{}])[0]
+                nearest = data.get("nearest_area", [{}])[0]
+                area_name = (
+                    nearest.get("areaName", [{}])[0].get("value")
+                    if nearest.get("areaName")
+                    else (city or "your location")
+                )
+                condition = current.get("weatherDesc", [{}])[0].get("value", "Unknown")
+                temp_c = current.get("temp_C", "?")
+                feels = current.get("FeelsLikeC", "?")
+                humidity = current.get("humidity", "?")
+
+                return (
+                    f"Live weather data for {area_name}: {condition}, temperature {temp_c}C, "
+                    f"feels like {feels}C, humidity {humidity} percent."
+                )
+            except Exception as exc:
+                print(f"Weather fetch error: {exc}")
+                return "Live weather data is currently unavailable."
+
+        local_base = os.getenv("AI_LOCAL_API_BASE", "http://127.0.0.1:11434")
+        local_model = os.getenv("AI_LOCAL_MODEL", "llama3.2:3b")
+        api_key = os.getenv("AI_CHAT_API_KEY") or os.getenv("OPENAI_API_KEY")
+        api_base = os.getenv("AI_CHAT_API_BASE", "https://api.openai.com/v1")
+        model = os.getenv("AI_CHAT_MODEL", "gpt-4o-mini")
+        weather_info = weather_context(user_text)
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        system_prompt = (
+            "You are JARVIS: concise, helpful, and speak in short replies. "
+            "If live weather context is provided, use it directly and do not invent weather values. "
+            f"Current local datetime is {now_text}."
+        )
+
+        prompt_text = user_text if not weather_info else f"{user_text}\n\nContext: {weather_info}"
+        local_available = ensure_ollama_server_running(local_base)
+
+        # Prefer free local chat via Ollama if available.
+        if local_available:
+            try:
+                response = requests.post(
+                    f"{local_base.rstrip('/')}/api/chat",
+                    json={
+                        "model": local_model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt_text},
+                        ],
+                        "stream": False,
+                    },
+                    timeout=12,
+                )
+                if response.ok:
+                    data = response.json()
+                    content = data.get("message", {}).get("content", "").strip()
+                    if content:
+                        return content
+            except Exception as exc:
+                print(f"Local Ollama chat error: {exc}")
+
+        if api_key:
+            try:
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt_text},
+                ]
+                response = requests.post(
+                    f"{api_base.rstrip('/')}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "temperature": 0.7,
+                        "max_tokens": 120,
+                    },
+                    timeout=20,
+                )
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"].strip()
+            except Exception as exc:
+                print(f"Voice chat API error: {exc}")
+
+        lower = user_text.lower().strip()
+        if any(phrase in lower for phrase in ["how are you", "how are u", "what's up", "whats up"]):
+            return "I am ready and listening."
+        if any(phrase in lower for phrase in ["who are you", "what are you"]):
+            return "I am JARVIS, your voice assistant."
+        if weather_info:
+            return weather_info
+        if lower.endswith("?"):
+            return "I can answer commands and chat. For free local chat, run Ollama."
+        return "Say JARVIS plus a command, or ask me a question."
+
+    def handle_voice_wake():
+        reply("Yes?")
+
+    def handle_voice_heard(_raw_text, normalized_text):
+        nonlocal voice_last_heard
+        voice_last_heard = normalized_text[:50] if normalized_text else "-"
+
+    def handle_voice_state(state):
+        nonlocal voice_state
+        voice_state = state
+
+    def handle_voice_command(text):
+        nonlocal voice_last_command, voice_enabled, last_volume_level, voice_listener
+
+        command = text.strip().lower()
+        print(f"Voice command: {command}")
+
+        if command in {"voice off", "stop voice", "disable voice", "mute voice input"}:
+            voice_enabled = False
+            if voice_listener:
+                voice_listener.set_enabled(False)
+            reply("Voice control off")
+            print("Voice control disabled")
+            return
+
+        if "jarvis off" in command or "deactivate jarvis" in command:
+            reply("JARVIS off")
+            return
+
+        if "jarvis on" in command or "activate jarvis" in command or command == "jarvis":
+            reply("JARVIS on")
+            return
+
+        if "iot mode" in command or "go to iot" in command:
+            set_mode("IOT")
+            reply("I O T mode")
+            return
+
+        if "spotify mode" in command or "go to spotify" in command:
+            set_mode("SPOTIFY")
+            reply("Spotify mode")
+            return
+
+        if command in {"play", "resume", "start playback"} or "play music" in command:
+            if current_mode != "SPOTIFY":
+                set_mode("SPOTIFY")
+            spotify_play_only()
+            reply("Playing music")
+            return
+
+        if command in {"pause", "stop playback"} or "pause music" in command:
+            if current_mode != "SPOTIFY":
+                set_mode("SPOTIFY")
+            spotify_pause_only()
+            reply("Music paused")
+            return
+
+        if command in {"next", "next track", "skip"}:
+            if current_mode != "SPOTIFY":
+                set_mode("SPOTIFY")
+            spotify_next_track()
+            reply("Next track")
+            return
+
+        if command in {"previous", "prev", "previous track", "back"}:
+            if current_mode != "SPOTIFY":
+                set_mode("SPOTIFY")
+            spotify_previous_track()
+            reply("Previous track")
+            return
+
+        if "volume up" in command or "raise volume" in command or "louder" in command:
+            level = 60 if last_volume_level is None else min(100, last_volume_level + 10)
+            last_volume_level = level
+            spotify_set_volume(level)
+            reply(f"Volume {level} percent")
+            return
+
+        if "volume down" in command or "lower volume" in command or "softer" in command:
+            level = 40 if last_volume_level is None else max(0, last_volume_level - 10)
+            last_volume_level = level
+            spotify_set_volume(level)
+            reply(f"Volume {level} percent")
+            return
+
+        if command in {"mute", "toggle mute", "mute audio"}:
+            if spotify_toggle_mute():
+                reply("Mute toggled")
+            else:
+                reply("Mute is unavailable on this setup")
+            return
+
+        volume_hint = any(tag in command for tag in ["volume", "vol", "voue", "volum", "audio"])
+        volume_match = re.search(r"(?:set\s+)?(?:volume|vol|voue|volum)(?:\s+to)?\s+(\d{1,3})", command)
+        if not volume_match and volume_hint:
+            number_match = re.search(r"(\d{1,3})", command)
+            if number_match:
+                volume_match = number_match
+
+        if volume_match:
+            level = max(0, min(100, int(volume_match.group(1))))
+            last_volume_level = level
+            spotify_set_volume(level)
+            reply(f"Volume {level} percent")
+            return
+
+        reply(chat_reply(command))
+
+    voice_listener = VoiceCommandListener(
+        on_command=handle_voice_command,
+        on_wake=handle_voice_wake,
+        on_heard=handle_voice_heard,
+        on_state=handle_voice_state,
+        on_error=lambda message: print(message),
+        require_wake_word=False,
+    )
+    voice_listener.start()
+
+    # Warm up local LLM server once at startup so first query is fast.
+    ensure_ollama_server_running(os.getenv("AI_LOCAL_API_BASE", "http://127.0.0.1:11434"))
+
     if current_mode == "IOT":
         send_arduino("G")
 
@@ -394,7 +717,7 @@ def main():
             dy = index_base[1] - wrist[1]
             jarvis_angle = math.degrees(math.atan2(dy, dx)) + 90
 
-            if current_mode == "IOT":
+            if current_mode == "IOT" and not voice_enabled:
                 if detected_count != 0 and must_release_fist_after_spotify:
                     must_release_fist_after_spotify = False
 
@@ -466,7 +789,7 @@ def main():
                         gesture_name = "JARVIS"
                         jarvis_active = True
 
-            if current_mode == "SPOTIFY":
+            if current_mode == "SPOTIFY" and not voice_enabled:
                 display_mode = current_mode
                 spotify_trigger_time = 0
                 jarvis_active = False
@@ -604,7 +927,7 @@ def main():
 
         last_pinch_state = pinch_detected
 
-        if current_mode == "IOT":
+        if current_mode == "IOT" and not voice_enabled:
             send_arduino(cmd)
 
         canvas = cv2.subtract(canvas, (15, 15, 15, 0))
@@ -615,6 +938,10 @@ def main():
 
         cv2.putText(frame, f"MODE: {display_mode} MODE", (20, 40), 1, 2, mode_color, 3)
         cv2.putText(frame, f"GESTURE: {gesture_name}", (20, 80), 1, 2.4, color, 3)
+        cv2.putText(frame, f"VOICE: {'ON' if voice_enabled else 'OFF'}", (20, 120), 1, 2.0, (255, 255, 0), 2)
+        cv2.putText(frame, f"VOICE STATE: {voice_state}", (20, 160), 1, 1.4, (200, 200, 200), 2)
+        cv2.putText(frame, f"HEARD: {voice_last_heard}", (20, 195), 1, 1.2, (170, 170, 170), 2)
+        cv2.putText(frame, f"VOICE REPLY: {voice_last_command}", (20, 230), 1, 1.2, (200, 200, 200), 2)
 
         if switch_countdown is not None and current_mode == "IOT":
             cv2.putText(frame, "Switching...", (w // 2 - 170, h // 2 - 30), 1, 2.2, (0, 200, 255), 4)
@@ -634,10 +961,20 @@ def main():
 
         cv2.imshow("IoT Interface Final", frame)
 
-        if cv2.waitKey(1) & 0xFF == 27:
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("v"):
+            voice_enabled = not voice_enabled
+            voice_listener.set_enabled(voice_enabled)
+            voice_last_command = "VOICE ON" if voice_enabled else "VOICE OFF"
+            print(f"Voice control {'enabled' if voice_enabled else 'disabled'}")
+
+        if key == 27:
             break
 
     cap.release()
+    if voice_listener:
+        voice_listener.stop()
     cv2.destroyAllWindows()
 
 

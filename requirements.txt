@@ -3,4 +3,6 @@ numpy==2.4.4
 opencv-python==4.13.0.92
 pygame==2.6.1
 pyserial==3.5
+sounddevice==0.5.5
+SpeechRecognition==3.16.0
 spotipy==2.25.1
