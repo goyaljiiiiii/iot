@@ -1,9 +1,11 @@
 import glob
 import math
 import random
+import shutil
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import cv2
@@ -17,6 +19,13 @@ from iot_control.spotify import create_spotify_client
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 AUDIO_DIR = ROOT_DIR / "audios"
+
+
+warnings.filterwarnings(
+    "ignore",
+    message="SymbolDatabase.GetPrototype\(\) is deprecated",
+    category=UserWarning,
+)
 
 
 def load_sound(filename):
@@ -33,6 +42,17 @@ def load_sound(filename):
 
 def main():
     sp = create_spotify_client()
+    playerctl_available = shutil.which("playerctl") is not None
+    pactl_available = shutil.which("pactl") is not None
+    spotify_player_name = None
+    last_player_scan_time = 0.0
+    PLAYER_SCAN_INTERVAL = 1.0
+
+    if not sp:
+        if playerctl_available:
+            print("Spotify Web API unavailable. Using local Spotify controls via playerctl.")
+        else:
+            print("Spotify controls are unavailable. Install playerctl or configure Spotify API credentials.")
 
     pygame.mixer.pre_init(44100, -16, 2, 512)
     pygame.mixer.init()
@@ -48,20 +68,182 @@ def main():
             print(f"Spotify Error: {e} (Make sure Spotify is open and active on a device!)")
 
     def toggle_spotify_playback():
-        if not sp:
-            print("Spotify is not configured or failed to authenticate. Check your .env and redirect URI.")
+        if sp:
+            try:
+                playback = sp.current_playback()
+                is_playing = bool(playback and playback.get("is_playing"))
+                if is_playing:
+                    sp.pause_playback()
+                    print("Spotify: Paused")
+                else:
+                    sp.start_playback()
+                    print("Spotify: Playing")
+                return
+            except Exception as e:
+                print(f"Spotify API Error: {e}. Falling back to local control.")
+
+        if not playerctl_available:
+            print("Local Spotify control requires playerctl. Install it: sudo apt install playerctl")
             return
-        try:
-            playback = sp.current_playback()
-            is_playing = bool(playback and playback.get("is_playing"))
-            if is_playing:
-                sp.pause_playback()
-                print("Spotify: Paused")
-            else:
-                sp.start_playback()
-                print("Spotify: Playing")
-        except Exception as e:
-            print(f"Spotify Error: {e} (Make sure Spotify is open and active on a device!)")
+
+        local_spotify_command(["play-pause"], "Spotify: Toggled play/pause (local)")
+
+    def spotify_play_only():
+        if sp:
+            safe_spotify_call(lambda: sp.start_playback(), "Spotify: Play")
+            return
+
+        local_spotify_command(["play"], "Spotify: Play (local)")
+
+    def spotify_pause_only():
+        if sp:
+            safe_spotify_call(lambda: sp.pause_playback(), "Spotify: Pause")
+            return
+
+        local_spotify_command(["pause"], "Spotify: Pause (local)")
+
+    def detect_spotify_player_name(force=False):
+        nonlocal spotify_player_name, last_player_scan_time
+
+        if not playerctl_available:
+            return None
+
+        now = time.time()
+        if not force and spotify_player_name and (now - last_player_scan_time) < PLAYER_SCAN_INTERVAL:
+            return spotify_player_name
+
+        if not force and (now - last_player_scan_time) < PLAYER_SCAN_INTERVAL:
+            return spotify_player_name
+
+        last_player_scan_time = now
+
+        result = subprocess.run(
+            ["playerctl", "-l"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        players = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if not players:
+            spotify_player_name = None
+            return None
+
+        if "spotify" in players:
+            spotify_player_name = "spotify"
+            return spotify_player_name
+
+        spotify_like = [p for p in players if "spotify" in p.lower()]
+        if spotify_like:
+            spotify_player_name = spotify_like[0]
+            print(f"Detected Spotify player: {spotify_player_name}")
+            return spotify_player_name
+
+        # Browser players can expose Spotify via metadata URL/title.
+        for player in players:
+            meta = subprocess.run(
+                ["playerctl", "--player", player, "metadata"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.lower()
+
+            if "open.spotify.com" in meta or "spotify" in meta:
+                spotify_player_name = player
+                print(f"Detected Spotify web player: {spotify_player_name}")
+                return spotify_player_name
+
+        spotify_player_name = None
+
+        return spotify_player_name
+
+    def local_spotify_command(args, success_label):
+        nonlocal spotify_player_name
+
+        if not playerctl_available:
+            print("Local Spotify control requires playerctl. Install it: sudo apt install playerctl")
+            return False
+
+        if not spotify_player_name:
+            detect_spotify_player_name()
+
+        cmd = ["playerctl"]
+        if spotify_player_name:
+            cmd.extend(["--player", spotify_player_name])
+        cmd.extend(args)
+
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+        # Quick one-time refresh if player identity changed.
+        if result.returncode != 0:
+            spotify_player_name = None
+            detect_spotify_player_name(force=True)
+
+            retry_cmd = ["playerctl"]
+            if spotify_player_name:
+                retry_cmd.extend(["--player", spotify_player_name])
+            retry_cmd.extend(args)
+            result = subprocess.run(retry_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+        # Ubuntu browser sessions often expose changing player names; try all players.
+        if result.returncode != 0:
+            fallback_cmd = ["playerctl", "-a", *args]
+            result = subprocess.run(fallback_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+        if result.returncode == 0:
+            print(success_label)
+            return True
+
+        print("Local Spotify control failed. Start playback once in Spotify desktop/web, then retry gesture.")
+        return False
+
+    def spotify_next_track():
+        if sp:
+            safe_spotify_call(lambda: sp.next_track(), "Spotify: Next track")
+        else:
+            local_spotify_command(["next"], "Spotify: Next track (local)")
+
+    def spotify_previous_track():
+        if sp:
+            safe_spotify_call(lambda: sp.previous_track(), "Spotify: Previous track")
+        else:
+            local_spotify_command(["previous"], "Spotify: Previous track (local)")
+
+    def spotify_set_volume(volume_level):
+        if sp:
+            safe_spotify_call(
+                lambda level=volume_level: sp.volume(level),
+                f"Spotify Volume: {volume_level}%",
+            )
+            return
+
+        if pactl_available:
+            result = subprocess.run(
+                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{volume_level}%"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode == 0:
+                print(f"System Volume: {volume_level}%")
+                return
+
+        local_volume = max(0.0, min(1.0, volume_level / 100.0))
+        local_spotify_command(["volume", f"{local_volume:.2f}"], f"Spotify Volume: {volume_level}% (local)")
+
+    def spotify_toggle_mute():
+        if pactl_available:
+            result = subprocess.run(
+                ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode == 0:
+                print("System Mute toggled")
+                return
+
+        print("Mute toggle requires pactl on this setup.")
 
     sound_count = load_sound("count.mp3")
     sound_click = load_sound("click.mp3")
@@ -115,6 +297,7 @@ def main():
 
     def launch_spotify_app():
         candidates = [
+            ["xdg-open", "https://open.spotify.com/"],
             ["spotify"],
             ["flatpak", "run", "com.spotify.Client"],
             ["snap", "run", "spotify"],
@@ -124,7 +307,10 @@ def main():
         for command in candidates:
             try:
                 subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                print(f"Launching Spotify with: {' '.join(command)}")
+                if "open.spotify.com" in command[-1]:
+                    print("Launching Spotify Web in browser")
+                else:
+                    print(f"Launching Spotify with: {' '.join(command)}")
                 return True
             except Exception:
                 continue
@@ -215,14 +401,14 @@ def main():
                 if detected_count == 4:
                     if spotify_trigger_time == 0:
                         spotify_trigger_time = time.time()
-                        if not spotify_launch_attempted:
-                            spotify_launch_attempted = True
-                            launch_spotify_app()
                     elapsed = time.time() - spotify_trigger_time
                     remaining = max(0.0, 2.0 - elapsed)
                     switch_countdown = remaining
                     gesture_name = "SWITCHING..."
                     if elapsed >= 2.0:
+                        if not spotify_launch_attempted:
+                            spotify_launch_attempted = True
+                            launch_spotify_app()
                         set_mode("SPOTIFY")
                         display_mode = current_mode
                         gesture_name = "SPOTIFY MODE"
@@ -254,10 +440,6 @@ def main():
                                 print("SHUTDOWN")
                                 pygame.mixer.stop()
                                 sys.exit()
-                    elif detected_count == 5:
-                        gesture_name = "JARVIS ACTIVE"
-                        cmd = "5"
-                        jarvis_active = True
                     elif pinch_detected:
                         gesture_name = "PINCH/SPARKLE"
                         cmd = "P"
@@ -280,6 +462,9 @@ def main():
                         gesture_name, cmd = "TWO", "2"
                     elif detected_count == 3:
                         gesture_name, cmd = "THREE", "3"
+                    elif detected_count == 5:
+                        gesture_name = "JARVIS"
+                        jarvis_active = True
 
             if current_mode == "SPOTIFY":
                 display_mode = current_mode
@@ -304,33 +489,26 @@ def main():
                 else:
                     spotify_exit_start_time = 0
 
-                    if detected_count == 1:
-                        gesture_name = "PLAY/PAUSE"
-                        if last_spotify_gesture != "play_pause":
-                            toggle_spotify_playback()
-                        last_spotify_gesture = "play_pause"
-                    elif detected_count == 2:
+                    if detected_count == 4:
                         gesture_name = "NEXT TRACK"
                         if last_spotify_gesture != "next":
-                            safe_spotify_call(lambda: sp.next_track() if sp else None, "Spotify: Next track")
+                            spotify_next_track()
                         last_spotify_gesture = "next"
+                    elif detected_count == 1:
+                        gesture_name = "PLAY"
+                        if last_spotify_gesture != "play":
+                            spotify_play_only()
+                        last_spotify_gesture = "play"
+                    elif detected_count == 2:
+                        gesture_name = "PAUSE"
+                        if last_spotify_gesture != "pause":
+                            spotify_pause_only()
+                        last_spotify_gesture = "pause"
                     elif detected_count == 3:
                         gesture_name = "PREVIOUS TRACK"
                         if last_spotify_gesture != "prev":
-                            safe_spotify_call(lambda: sp.previous_track() if sp else None, "Spotify: Previous track")
+                            spotify_previous_track()
                         last_spotify_gesture = "prev"
-                    elif detected_count == 5:
-                        gesture_name = "SPOTIFY VOLUME"
-                        volume_level = int(np.interp(wrist[1], [h, 0], [0, 100]))
-                        volume_level = max(0, min(100, volume_level))
-
-                        if last_volume_level is None or abs(volume_level - last_volume_level) >= 5:
-                            safe_spotify_call(
-                                lambda level=volume_level: sp.volume(level) if sp else None,
-                                f"Spotify Volume: {volume_level}%",
-                            )
-                            last_volume_level = volume_level
-                        last_spotify_gesture = "volume"
                     else:
                         gesture_name = "SPOTIFY READY"
                         last_spotify_gesture = None
