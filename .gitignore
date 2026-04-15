@@ -5,18 +5,32 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Virtual environments
 myenv/
 .venv/
 venv/
+env/
 
 # Environment files
 .env
+.env.*
+!.env.example
 
 # Local runtime cache
 .cache
+.cache/
+.spotipyoauthcache
+*.log
 
 # OS/editor files
 .DS_Store
 .vscode/
+.idea/
+*.swp
+*.swo

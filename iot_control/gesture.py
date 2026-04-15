@@ -18,6 +18,11 @@ import pygame
 import requests
 import serial
 
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
+
 from iot_control.spotify import create_spotify_client
 from iot_control.voice import VoiceCommandListener
 
@@ -267,7 +272,46 @@ def main():
         min_tracking_confidence=0.7,
     )
 
-    cap = cv2.VideoCapture(0)
+    def open_camera():
+        env_index = os.getenv("CAMERA_INDEX", "").strip()
+        if env_index:
+            parts = [p.strip() for p in env_index.split(",") if p.strip()]
+            indices = [int(p) for p in parts if p.isdigit()]
+        else:
+            indices = list(range(0, 10))
+
+        if not indices:
+            indices = [0]
+
+        for index in indices:
+            # First try default backend, then explicit V4L2 fallback.
+            for backend in (None, cv2.CAP_V4L2, cv2.CAP_ANY):
+                try:
+                    if backend is None:
+                        cap_obj = cv2.VideoCapture(index)
+                    else:
+                        cap_obj = cv2.VideoCapture(index, backend)
+                except Exception:
+                    cap_obj = None
+
+                if cap_obj is not None and cap_obj.isOpened():
+                    # Confirm at least one frame can be read before accepting.
+                    ok, _ = cap_obj.read()
+                    if not ok:
+                        cap_obj.release()
+                        continue
+                    print(f"Camera opened on index {index}")
+                    return cap_obj, index
+
+                if cap_obj is not None:
+                    cap_obj.release()
+
+        return None, None
+
+    cap, camera_index = open_camera()
+    if cap is None:
+        print("No usable camera found. Check webcam connection/permissions or set CAMERA_INDEX.")
+        return
 
     canvas = None
     last_sent = ""
@@ -282,12 +326,27 @@ def main():
     last_spotify_gesture = None
     must_release_fist_after_spotify = False
     spotify_launch_attempted = False
+    spotify_pending_gesture = None
+    spotify_pending_since = 0.0
+    spotify_last_action_time = 0.0
+    spotify_wait_release = False
+    SPOTIFY_HOLD_SECONDS = 0.35
+    SPOTIFY_COOLDOWN_SECONDS = 0.85
     voice_enabled = False
     voice_last_command = "VOICE OFF"
     voice_last_heard = "-"
     voice_state = "voice_off"
     voice_listener = None
     ollama_autostart_attempted = False
+    voice_chat_history = []
+    MAX_CHAT_HISTORY_MESSAGES = 8
+    startup_checks_last_refresh = 0.0
+    startup_checks = {
+        "MIC": False,
+        "OLLAMA": False,
+        "SPOTIFY": False,
+        "ARDUINO": False,
+    }
 
     def resolve_ollama_binary():
         candidates = [
@@ -338,6 +397,32 @@ def main():
 
         print("Ollama server is not reachable.")
         return False
+
+    def microphone_available():
+        if sd is None:
+            return False
+        try:
+            devices = sd.query_devices()
+            default_input = None
+            if hasattr(sd, "default") and hasattr(sd.default, "device"):
+                default_input = sd.default.device[0]
+
+            if isinstance(default_input, int) and default_input >= 0:
+                if devices[default_input].get("max_input_channels", 0) > 0:
+                    return True
+
+            return any(device.get("max_input_channels", 0) > 0 for device in devices)
+        except Exception:
+            return False
+
+    def collect_startup_checks():
+        local_base = os.getenv("AI_LOCAL_API_BASE", "http://127.0.0.1:11434")
+        return {
+            "MIC": microphone_available(),
+            "OLLAMA": ollama_server_available(local_base),
+            "SPOTIFY": bool(sp or playerctl_available),
+            "ARDUINO": arduino is not None,
+        }
 
     def speak(text):
         if shutil.which("spd-say"):
@@ -393,6 +478,7 @@ def main():
 
     def set_mode(mode):
         nonlocal current_mode, spotify_trigger_time, spotify_exit_start_time, last_sent, last_volume_level, last_spotify_gesture, spotify_launch_attempted
+        nonlocal spotify_pending_gesture, spotify_pending_since, spotify_last_action_time, spotify_wait_release
 
         if current_mode == mode:
             return
@@ -404,6 +490,10 @@ def main():
         last_volume_level = None
         last_spotify_gesture = None
         spotify_launch_attempted = False
+        spotify_pending_gesture = None
+        spotify_pending_since = 0.0
+        spotify_last_action_time = 0.0
+        spotify_wait_release = False
         print(f"Mode switched to {current_mode}")
 
         if current_mode == "IOT":
@@ -415,6 +505,8 @@ def main():
         speak(text)
 
     def chat_reply(user_text):
+        nonlocal voice_chat_history
+
         def extract_city(text):
             match = re.search(r"\bin\s+([a-zA-Z\s]{2,40})", text)
             if not match:
@@ -477,6 +569,9 @@ def main():
 
         prompt_text = user_text if not weather_info else f"{user_text}\n\nContext: {weather_info}"
         local_available = ensure_ollama_server_running(local_base)
+        messages = [{"role": "system", "content": system_prompt}] + voice_chat_history + [
+            {"role": "user", "content": prompt_text}
+        ]
 
         # Prefer free local chat via Ollama if available.
         if local_available:
@@ -485,10 +580,7 @@ def main():
                     f"{local_base.rstrip('/')}/api/chat",
                     json={
                         "model": local_model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": prompt_text},
-                        ],
+                        "messages": messages,
                         "stream": False,
                     },
                     timeout=12,
@@ -497,16 +589,19 @@ def main():
                     data = response.json()
                     content = data.get("message", {}).get("content", "").strip()
                     if content:
+                        voice_chat_history.extend(
+                            [
+                                {"role": "user", "content": prompt_text},
+                                {"role": "assistant", "content": content},
+                            ]
+                        )
+                        voice_chat_history = voice_chat_history[-MAX_CHAT_HISTORY_MESSAGES:]
                         return content
             except Exception as exc:
                 print(f"Local Ollama chat error: {exc}")
 
         if api_key:
             try:
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt_text},
-                ]
                 response = requests.post(
                     f"{api_base.rstrip('/')}/chat/completions",
                     headers={
@@ -523,7 +618,16 @@ def main():
                 )
                 response.raise_for_status()
                 data = response.json()
-                return data["choices"][0]["message"]["content"].strip()
+                content = data["choices"][0]["message"]["content"].strip()
+                if content:
+                    voice_chat_history.extend(
+                        [
+                            {"role": "user", "content": prompt_text},
+                            {"role": "assistant", "content": content},
+                        ]
+                    )
+                    voice_chat_history = voice_chat_history[-MAX_CHAT_HISTORY_MESSAGES:]
+                return content
             except Exception as exc:
                 print(f"Voice chat API error: {exc}")
 
@@ -532,11 +636,13 @@ def main():
             return "I am ready and listening."
         if any(phrase in lower for phrase in ["who are you", "what are you"]):
             return "I am JARVIS, your voice assistant."
+        if any(phrase in lower for phrase in ["your name", "who am i talking", "who is this"]):
+            return "I am JARVIS, your AI assistant."
         if weather_info:
             return weather_info
         if lower.endswith("?"):
-            return "I can answer commands and chat. For free local chat, run Ollama."
-        return "Say JARVIS plus a command, or ask me a question."
+            return "I can answer that. If my local model is offline, I may give shorter fallback replies."
+        return "I am here. Ask me anything or give a command."
 
     def handle_voice_wake():
         reply("Yes?")
@@ -553,7 +659,12 @@ def main():
         nonlocal voice_last_command, voice_enabled, last_volume_level, voice_listener
 
         command = text.strip().lower()
+        command = re.sub(r"^\s*jarvis\b[\s,.:;-]*", "", command).strip()
         print(f"Voice command: {command}")
+
+        if not command:
+            reply("Yes?")
+            return
 
         if command in {"voice off", "stop voice", "disable voice", "mute voice input"}:
             voice_enabled = False
@@ -658,6 +769,8 @@ def main():
 
     # Warm up local LLM server once at startup so first query is fast.
     ensure_ollama_server_running(os.getenv("AI_LOCAL_API_BASE", "http://127.0.0.1:11434"))
+    startup_checks = collect_startup_checks()
+    startup_checks_last_refresh = time.time()
 
     if current_mode == "IOT":
         send_arduino("G")
@@ -665,6 +778,7 @@ def main():
     while True:
         ret, frame = cap.read()
         if not ret:
+            print(f"Camera read failed on index {camera_index}. Closing app.")
             break
 
         frame = cv2.flip(frame, 1)
@@ -801,6 +915,8 @@ def main():
                     elapsed = time.time() - spotify_exit_start_time
                     switch_countdown = max(0.0, 3.0 - elapsed)
                     gesture_name = "EXITING TO IOT"
+                    spotify_wait_release = False
+                    spotify_pending_gesture = None
 
                     if elapsed >= 3.0:
                         must_release_fist_after_spotify = True
@@ -811,30 +927,45 @@ def main():
                         spotify_exit_start_time = 0
                 else:
                     spotify_exit_start_time = 0
+                    now = time.time()
+                    gesture_map = {
+                        1: ("play", "PLAY", spotify_play_only),
+                        2: ("pause", "PAUSE", spotify_pause_only),
+                        3: ("prev", "PREVIOUS TRACK", spotify_previous_track),
+                        4: ("next", "NEXT TRACK", spotify_next_track),
+                    }
+                    mapped = gesture_map.get(detected_count)
 
-                    if detected_count == 4:
-                        gesture_name = "NEXT TRACK"
-                        if last_spotify_gesture != "next":
-                            spotify_next_track()
-                        last_spotify_gesture = "next"
-                    elif detected_count == 1:
-                        gesture_name = "PLAY"
-                        if last_spotify_gesture != "play":
-                            spotify_play_only()
-                        last_spotify_gesture = "play"
-                    elif detected_count == 2:
-                        gesture_name = "PAUSE"
-                        if last_spotify_gesture != "pause":
-                            spotify_pause_only()
-                        last_spotify_gesture = "pause"
-                    elif detected_count == 3:
-                        gesture_name = "PREVIOUS TRACK"
-                        if last_spotify_gesture != "prev":
-                            spotify_previous_track()
-                        last_spotify_gesture = "prev"
-                    else:
+                    if not mapped:
                         gesture_name = "SPOTIFY READY"
+                        spotify_pending_gesture = None
+                        spotify_wait_release = False
                         last_spotify_gesture = None
+                    else:
+                        gesture_key, gesture_label, action = mapped
+                        gesture_name = gesture_label
+
+                        if spotify_wait_release:
+                            gesture_name = f"{gesture_label} (RELEASE)"
+                            spotify_pending_gesture = None
+                        else:
+                            if spotify_pending_gesture != gesture_key:
+                                spotify_pending_gesture = gesture_key
+                                spotify_pending_since = now
+
+                            hold_elapsed = now - spotify_pending_since
+                            cooldown_left = max(0.0, SPOTIFY_COOLDOWN_SECONDS - (now - spotify_last_action_time))
+
+                            if hold_elapsed >= SPOTIFY_HOLD_SECONDS and cooldown_left <= 0.0:
+                                action()
+                                last_spotify_gesture = gesture_key
+                                spotify_last_action_time = now
+                                spotify_wait_release = True
+                                spotify_pending_gesture = None
+                            elif hold_elapsed < SPOTIFY_HOLD_SECONDS:
+                                gesture_name = f"{gesture_label} ({SPOTIFY_HOLD_SECONDS - hold_elapsed:0.1f}s)"
+                            elif cooldown_left > 0.0:
+                                gesture_name = f"{gesture_label} ({cooldown_left:0.1f}s)"
 
         else:
             spotify_trigger_time = 0
@@ -936,12 +1067,34 @@ def main():
         mode_color = (0, 255, 0) if current_mode == "IOT" else (0, 200, 255)
         color = (0, 255, 0) if gesture_name != "FIST" else (0, 0, 255)
 
+        now = time.time()
+        if now - startup_checks_last_refresh >= 2.0:
+            startup_checks = collect_startup_checks()
+            startup_checks_last_refresh = now
+
         cv2.putText(frame, f"MODE: {display_mode} MODE", (20, 40), 1, 2, mode_color, 3)
         cv2.putText(frame, f"GESTURE: {gesture_name}", (20, 80), 1, 2.4, color, 3)
         cv2.putText(frame, f"VOICE: {'ON' if voice_enabled else 'OFF'}", (20, 120), 1, 2.0, (255, 255, 0), 2)
         cv2.putText(frame, f"VOICE STATE: {voice_state}", (20, 160), 1, 1.4, (200, 200, 200), 2)
         cv2.putText(frame, f"HEARD: {voice_last_heard}", (20, 195), 1, 1.2, (170, 170, 170), 2)
         cv2.putText(frame, f"VOICE REPLY: {voice_last_command}", (20, 230), 1, 1.2, (200, 200, 200), 2)
+
+        panel_x = max(20, w - 290)
+        panel_y = 20
+        panel_w = 260
+        panel_h = 150
+        cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (35, 35, 35), -1)
+        cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (90, 90, 90), 1)
+        cv2.putText(frame, "STARTUP CHECKS", (panel_x + 10, panel_y + 28), 1, 1.0, (255, 255, 255), 2)
+
+        check_items = ["MIC", "OLLAMA", "SPOTIFY", "ARDUINO"]
+        for index, key in enumerate(check_items):
+            ok = bool(startup_checks.get(key))
+            label = "OK" if ok else "MISSING"
+            status_color = (0, 220, 0) if ok else (0, 0, 255)
+            y = panel_y + 56 + index * 22
+            cv2.putText(frame, f"{key}:", (panel_x + 10, y), 1, 0.9, (220, 220, 220), 2)
+            cv2.putText(frame, label, (panel_x + 145, y), 1, 0.9, status_color, 2)
 
         if switch_countdown is not None and current_mode == "IOT":
             cv2.putText(frame, "Switching...", (w // 2 - 170, h // 2 - 30), 1, 2.2, (0, 200, 255), 4)
