@@ -7,6 +7,7 @@ This project combines:
 - OpenCV + MediaPipe hand tracking
 - Arduino serial commands for IoT actions
 - Spotify playback control (Web API or local fallback)
+- Google Tasks CRUD by voice (create, list, update, complete, delete)
 - Optional wake-word voice assistant behavior
 
 ## Features
@@ -57,6 +58,12 @@ This project combines:
    - `SPOTIFY_CLIENT_SECRET`
    - `SPOTIFY_REDIRECT_URI` (must match your Spotify app config)
 
+5. If using Google Tasks voice CRUD, set OAuth vars:
+   - `GOOGLE_TASKS_CLIENT_ID`
+   - `GOOGLE_TASKS_CLIENT_SECRET`
+   - `GOOGLE_TASKS_REFRESH_TOKEN`
+   - Optional: `GOOGLE_TASK_LIST_ID` or `GOOGLE_TASK_LIST_NAME`
+
 ## Run
 
 ```bash
@@ -75,14 +82,26 @@ python scripts/run_gesture.py
 - Press `Esc` to exit.
 - When voice mode is on, gesture actions are paused to prevent accidental triggers.
 
+### Voice Examples (Google Tasks)
+
+- `add task buy milk`
+- `list my tasks`
+- `update task buy milk to buy almond milk`
+- `complete task buy almond milk`
+- `del task buy almond milk`
+
 ## Environment Variables
 
 See `.env.example` for all supported keys. Important ones:
 
 - Spotify API: `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REDIRECT_URI`
+- Google Tasks: `GOOGLE_TASKS_CLIENT_ID`, `GOOGLE_TASKS_CLIENT_SECRET`, `GOOGLE_TASKS_REFRESH_TOKEN`, `GOOGLE_TASK_LIST_ID`, `GOOGLE_TASK_LIST_NAME`, `GOOGLE_TASKS_ACCESS_TOKEN`
 - Cloud AI chat: `OPENAI_API_KEY` or `AI_CHAT_API_KEY`, `AI_CHAT_API_BASE`, `AI_CHAT_MODEL`
 - Local AI chat (Ollama): `AI_LOCAL_API_BASE`, `AI_LOCAL_MODEL`, `AI_AUTO_START_OLLAMA`
 - Camera selection: `CAMERA_INDEX` (example: `0` or `0,1`)
+- Visual theme: `JARVIS_THEME` (`auto`, `amber`, `cyan`)
+- Render quality: `RENDER_QUALITY` (`performance`, `balanced`, `ultra`)
+- HUD/FPS display: `SHOW_FPS` (`true`/`false`), `JARVIS_BUILD_TAG` (example: `v1.0.0`)
 
 ## Troubleshooting
 

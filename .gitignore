@@ -28,6 +28,10 @@ env/
 .spotipyoauthcache
 *.log
 
+# Local user/runtime data
+profiles.json
+asset/models/
+
 # OS/editor files
 .DS_Store
 .vscode/

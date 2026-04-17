@@ -1,5 +1,6 @@
 import glob
 import ast
+import json
 import math
 import random
 import os
@@ -30,6 +31,34 @@ from iot_control.voice import VoiceCommandListener
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 AUDIO_DIR = ROOT_DIR / "audios"
+PROFILE_CONFIG_PATH = ROOT_DIR / "profiles.json"
+
+DEFAULT_PROFILE_CONFIG = {
+    "active_profile": "default",
+    "profiles": {
+        "default": {
+            "display_name": "Default",
+            "iot_gestures": {
+                "pinch": {"label": "PINCH/SPARKLE", "command": "P"},
+                "1": {"label": "ONE", "command": "1"},
+                "2": {"label": "TWO", "command": "2"},
+                "3": {"label": "THREE", "command": "3"},
+                "5": {"label": "JARVIS", "jarvis": True},
+            },
+            "spotify_gestures": {
+                "1": "play",
+                "2": "pause",
+                "3": "previous",
+                "4": "next",
+            },
+            "volume": {
+                "up_start": 60,
+                "down_start": 40,
+                "step": 10,
+            },
+        }
+    },
+}
 
 
 warnings.filterwarnings(
@@ -340,7 +369,14 @@ def main():
     voice_listener = None
     ollama_autostart_attempted = False
     voice_chat_history = []
-    MAX_CHAT_HISTORY_MESSAGES = 8
+    MAX_CHAT_HISTORY_MESSAGES = max(8, int(os.getenv("MAX_CHAT_HISTORY_MESSAGES", "16")))
+    VOICE_FAST_MODE = os.getenv("VOICE_FAST_MODE", "true").strip().lower() in {"1", "true", "yes", "on"}
+    MODEL_DISCOVERY_CACHE_SECONDS = float(os.getenv("MODEL_DISCOVERY_CACHE_SECONDS", "300"))
+    OLLAMA_STATUS_CACHE_SECONDS = float(os.getenv("OLLAMA_STATUS_CACHE_SECONDS", "2.0"))
+    cached_local_model_name = ""
+    cached_local_model_until = 0.0
+    cached_ollama_available = False
+    cached_ollama_available_until = 0.0
     startup_checks_last_refresh = 0.0
     startup_checks = {
         "MIC": False,
@@ -350,6 +386,264 @@ def main():
     }
     jarvis_distance_scale = 1.0
     jarvis_height_factor = 1.0
+    profile_config = {}
+    active_profile = "default"
+    google_tasks_access_token = None
+    google_tasks_token_expiry = 0.0
+    google_tasks_list_id = None
+    app_build_tag = os.getenv("JARVIS_BUILD_TAG", "v1.0.0").strip() or "v1.0.0"
+
+    visual_theme = os.getenv("JARVIS_THEME", "auto").strip().lower()
+    if visual_theme not in {"auto", "amber", "cyan"}:
+        visual_theme = "auto"
+
+    render_quality = os.getenv("RENDER_QUALITY", "balanced").strip().lower()
+    if render_quality not in {"performance", "balanced", "ultra"}:
+        render_quality = "balanced"
+
+    quality_presets = {
+        "performance": {
+            "bridge_strands": 2,
+            "bridge_rings": 2,
+            "bridge_steps": 6,
+            "tick_step": 18,
+            "particles_base": 3,
+            "particles_amp": 3,
+            "shell_bands": 2,
+            "chevrons": 5,
+            "rays": 8,
+            "trail_layers": 2,
+            "thread_segments": 8,
+        },
+        "balanced": {
+            "bridge_strands": 3,
+            "bridge_rings": 3,
+            "bridge_steps": 8,
+            "tick_step": 12,
+            "particles_base": 5,
+            "particles_amp": 5,
+            "shell_bands": 3,
+            "chevrons": 7,
+            "rays": 12,
+            "trail_layers": 3,
+            "thread_segments": 11,
+        },
+        "ultra": {
+            "bridge_strands": 4,
+            "bridge_rings": 3,
+            "bridge_steps": 10,
+            "tick_step": 10,
+            "particles_base": 6,
+            "particles_amp": 6,
+            "shell_bands": 3,
+            "chevrons": 8,
+            "rays": 16,
+            "trail_layers": 3,
+            "thread_segments": 13,
+        },
+    }
+    render_tuning = quality_presets[render_quality]
+    show_fps = os.getenv("SHOW_FPS", "true").strip().lower() in {"1", "true", "yes", "on"}
+    fps_counter = 0
+    fps_value = 0.0
+    fps_last_time = time.time()
+
+    def warm_palette_for_hand(hand_index):
+        if visual_theme == "amber":
+            return True
+        if visual_theme == "cyan":
+            return False
+        if current_mode == "SPOTIFY" or voice_enabled:
+            return False
+        return hand_index % 2 == 0
+
+    def load_profile_config():
+        config = json.loads(json.dumps(DEFAULT_PROFILE_CONFIG))
+
+        if not PROFILE_CONFIG_PATH.exists():
+            return config
+
+        try:
+            with PROFILE_CONFIG_PATH.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as exc:
+            print(f"Failed to read profiles config: {exc}")
+            return config
+
+        if not isinstance(raw, dict):
+            return config
+
+        profiles = raw.get("profiles")
+        if isinstance(profiles, dict):
+            for key, value in profiles.items():
+                if isinstance(key, str) and isinstance(value, dict):
+                    config["profiles"][key] = value
+
+        configured_active = raw.get("active_profile")
+        if isinstance(configured_active, str) and configured_active.strip():
+            config["active_profile"] = configured_active.strip()
+
+        return config
+
+    def get_active_profile_config():
+        profiles = profile_config.get("profiles", {})
+        selected = profiles.get(active_profile)
+        if isinstance(selected, dict):
+            return selected
+        return profiles.get("default", DEFAULT_PROFILE_CONFIG["profiles"]["default"])
+
+    def get_active_profile_name():
+        profile = get_active_profile_config()
+        display_name = profile.get("display_name")
+        if isinstance(display_name, str) and display_name.strip():
+            return display_name.strip()
+        return active_profile
+
+    def resolve_profile_key(requested_text):
+        requested = requested_text.strip().lower()
+        if not requested:
+            return None
+
+        profiles = profile_config.get("profiles", {})
+        if requested in profiles:
+            return requested
+
+        for key, profile in profiles.items():
+            if key.lower() == requested:
+                return key
+
+            display_name = profile.get("display_name") if isinstance(profile, dict) else None
+            if isinstance(display_name, str) and display_name.strip().lower() == requested:
+                return key
+
+        return None
+
+    def switch_profile(profile_key):
+        nonlocal active_profile, last_volume_level
+
+        if profile_key == active_profile:
+            return False
+
+        active_profile = profile_key
+        last_volume_level = None
+        print(f"Profile switched to {get_active_profile_name()} ({active_profile})")
+        return True
+
+    def normalized_profile_key(raw_name):
+        key = re.sub(r"[^a-z0-9]+", "_", raw_name.lower()).strip("_")
+        if not key:
+            return "user"
+        return key[:24]
+
+    def save_profile_config():
+        try:
+            profile_config["active_profile"] = active_profile
+            with PROFILE_CONFIG_PATH.open("w", encoding="utf-8") as f:
+                json.dump(profile_config, f, indent=2)
+                f.write("\n")
+            return True
+        except Exception as exc:
+            print(f"Failed to save profiles config: {exc}")
+            return False
+
+    def ensure_profile_from_name(raw_name):
+        clean_name = " ".join(raw_name.strip().split())
+        if len(clean_name) < 2:
+            return None, "I did not catch your name clearly. Please say it again."
+
+        existing_key = resolve_profile_key(clean_name)
+        if existing_key:
+            switch_profile(existing_key)
+            save_profile_config()
+            return False, get_active_profile_name()
+
+        base_key = normalized_profile_key(clean_name)
+        key = base_key
+        suffix = 2
+        profiles = profile_config.setdefault("profiles", {})
+        while key in profiles:
+            key = f"{base_key}_{suffix}"
+            suffix += 1
+
+        default_profile = DEFAULT_PROFILE_CONFIG["profiles"]["default"]
+        new_profile = json.loads(json.dumps(default_profile))
+        new_profile["display_name"] = clean_name.title()
+        profiles[key] = new_profile
+
+        switch_profile(key)
+        save_profile_config()
+        return True, get_active_profile_name()
+
+    def profile_volume_settings():
+        volume = get_active_profile_config().get("volume", {})
+        up_start = volume.get("up_start", 60)
+        down_start = volume.get("down_start", 40)
+        step = volume.get("step", 10)
+
+        try:
+            up_start = int(up_start)
+        except Exception:
+            up_start = 60
+        try:
+            down_start = int(down_start)
+        except Exception:
+            down_start = 40
+        try:
+            step = int(step)
+        except Exception:
+            step = 10
+
+        return {
+            "up_start": max(0, min(100, up_start)),
+            "down_start": max(0, min(100, down_start)),
+            "step": max(1, min(40, step)),
+        }
+
+    def iot_action_for_detection(detected_count_value, is_pinch):
+        gestures = get_active_profile_config().get("iot_gestures", {})
+        key = "pinch" if is_pinch else str(detected_count_value)
+        action = gestures.get(key)
+        if not isinstance(action, dict):
+            return None
+
+        label = action.get("label")
+        command = action.get("command")
+        jarvis = bool(action.get("jarvis", False))
+
+        if not isinstance(label, str) or not label.strip():
+            return None
+
+        command_str = ""
+        if isinstance(command, str):
+            command_str = command.strip()
+
+        return {
+            "label": label.strip(),
+            "command": command_str,
+            "jarvis": jarvis,
+        }
+
+    def spotify_action_for_count(detected_count_value):
+        spotify_handlers = {
+            "play": ("play", "PLAY", spotify_play_only),
+            "pause": ("pause", "PAUSE", spotify_pause_only),
+            "previous": ("previous", "PREVIOUS TRACK", spotify_previous_track),
+            "next": ("next", "NEXT TRACK", spotify_next_track),
+        }
+
+        mapping = get_active_profile_config().get("spotify_gestures", {})
+        action_name = mapping.get(str(detected_count_value))
+        if not isinstance(action_name, str):
+            return None
+
+        return spotify_handlers.get(action_name.strip().lower())
+
+    profile_config = load_profile_config()
+    requested_profile = os.getenv("ACTIVE_PROFILE", "").strip() or str(profile_config.get("active_profile", "default"))
+    resolved_profile = resolve_profile_key(requested_profile)
+    if resolved_profile:
+        active_profile = resolved_profile
+    print(f"Active profile: {get_active_profile_name()} ({active_profile})")
 
     def resolve_ollama_binary():
         candidates = [
@@ -426,6 +720,271 @@ def main():
             "SPOTIFY": bool(sp or playerctl_available),
             "ARDUINO": arduino is not None,
         }
+
+    def google_tasks_configured():
+        direct_access = os.getenv("GOOGLE_TASKS_ACCESS_TOKEN", "").strip()
+        refresh_token = os.getenv("GOOGLE_TASKS_REFRESH_TOKEN", "").strip()
+        client_id = os.getenv("GOOGLE_TASKS_CLIENT_ID", "").strip()
+        client_secret = os.getenv("GOOGLE_TASKS_CLIENT_SECRET", "").strip()
+        return bool(direct_access or (refresh_token and client_id and client_secret))
+
+    def get_google_tasks_access_token(force_refresh=False):
+        nonlocal google_tasks_access_token, google_tasks_token_expiry
+
+        static_token = os.getenv("GOOGLE_TASKS_ACCESS_TOKEN", "").strip()
+        if static_token:
+            return static_token
+
+        refresh_token = os.getenv("GOOGLE_TASKS_REFRESH_TOKEN", "").strip()
+        client_id = os.getenv("GOOGLE_TASKS_CLIENT_ID", "").strip()
+        client_secret = os.getenv("GOOGLE_TASKS_CLIENT_SECRET", "").strip()
+
+        if not (refresh_token and client_id and client_secret):
+            return None
+
+        now = time.time()
+        if not force_refresh and google_tasks_access_token and now < google_tasks_token_expiry - 30:
+            return google_tasks_access_token
+
+        try:
+            response = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                },
+                timeout=8,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            token = payload.get("access_token", "").strip()
+            expires_in = int(payload.get("expires_in", 3600))
+            if not token:
+                return None
+            google_tasks_access_token = token
+            google_tasks_token_expiry = now + max(60, expires_in)
+            return google_tasks_access_token
+        except Exception as exc:
+            print(f"Google Tasks auth error: {exc}")
+            return None
+
+    def google_tasks_request(method, endpoint, params=None, payload=None):
+        token = get_google_tasks_access_token()
+        if not token:
+            return None, "Google Tasks is not configured. Set OAuth env vars first."
+
+        base_url = "https://tasks.googleapis.com/tasks/v1"
+
+        def _do_request(access_token):
+            return requests.request(
+                method,
+                f"{base_url}{endpoint}",
+                params=params,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+
+        try:
+            response = _do_request(token)
+
+            if response.status_code == 401 and not os.getenv("GOOGLE_TASKS_ACCESS_TOKEN", "").strip():
+                refreshed = get_google_tasks_access_token(force_refresh=True)
+                if refreshed:
+                    response = _do_request(refreshed)
+
+            if not response.ok:
+                message = f"HTTP {response.status_code}"
+                try:
+                    err_payload = response.json()
+                    message = err_payload.get("error", {}).get("message") or message
+                except Exception:
+                    pass
+                return None, f"Google Tasks API error: {message}"
+
+            if response.text.strip():
+                return response.json(), None
+            return {}, None
+        except Exception as exc:
+            return None, f"Google Tasks request failed: {exc}"
+
+    def resolve_google_task_list_id():
+        nonlocal google_tasks_list_id
+
+        if google_tasks_list_id:
+            return google_tasks_list_id, None
+
+        explicit_list_id = os.getenv("GOOGLE_TASK_LIST_ID", "").strip()
+        if explicit_list_id:
+            google_tasks_list_id = explicit_list_id
+            return google_tasks_list_id, None
+
+        data, error = google_tasks_request("GET", "/users/@me/lists", params={"maxResults": 20})
+        if error:
+            return None, error
+
+        items = data.get("items", []) if isinstance(data, dict) else []
+        if not items:
+            return None, "No Google Task lists found on this account."
+
+        preferred_name = os.getenv("GOOGLE_TASK_LIST_NAME", "").strip().lower()
+        if preferred_name:
+            for item in items:
+                title = str(item.get("title", "")).strip().lower()
+                if title == preferred_name:
+                    google_tasks_list_id = item.get("id")
+                    break
+
+        if not google_tasks_list_id:
+            google_tasks_list_id = items[0].get("id")
+
+        if not google_tasks_list_id:
+            return None, "Could not resolve Google Task list ID."
+        return google_tasks_list_id, None
+
+    def normalize_task_text(raw_text):
+        text = " ".join(raw_text.split()).strip()
+        text = re.sub(r"^[\s:;,.\-]+", "", text)
+        text = re.sub(r"[\s:;,.\-]+$", "", text)
+        return text
+
+    def list_google_tasks(limit=5):
+        task_list_id, error = resolve_google_task_list_id()
+        if error:
+            return None, error
+
+        data, error = google_tasks_request(
+            "GET",
+            f"/lists/{task_list_id}/tasks",
+            params={
+                "maxResults": max(1, min(15, limit)),
+                "showCompleted": "false",
+                "showHidden": "false",
+            },
+        )
+        if error:
+            return None, error
+
+        items = data.get("items", []) if isinstance(data, dict) else []
+        readable = [item.get("title", "").strip() for item in items if item.get("title")]
+        return readable, None
+
+    def create_google_task(task_title):
+        task_list_id, error = resolve_google_task_list_id()
+        if error:
+            return None, error
+
+        data, error = google_tasks_request(
+            "POST",
+            f"/lists/{task_list_id}/tasks",
+            payload={"title": task_title},
+        )
+        if error:
+            return None, error
+
+        return data.get("title", task_title), None
+
+    def find_google_task_by_title(task_title):
+        task_list_id, error = resolve_google_task_list_id()
+        if error:
+            return None, None, error
+
+        data, error = google_tasks_request(
+            "GET",
+            f"/lists/{task_list_id}/tasks",
+            params={
+                "maxResults": 100,
+                "showCompleted": "true",
+                "showHidden": "true",
+            },
+        )
+        if error:
+            return None, None, error
+
+        wanted = task_title.strip().lower()
+        items = data.get("items", []) if isinstance(data, dict) else []
+        for item in items:
+            title = str(item.get("title", "")).strip()
+            if title.lower() == wanted:
+                return task_list_id, item, None
+
+        for item in items:
+            title = str(item.get("title", "")).strip().lower()
+            if wanted and wanted in title:
+                return task_list_id, item, None
+
+        return task_list_id, None, None
+
+    def delete_google_task(task_title):
+        task_list_id, task_item, error = find_google_task_by_title(task_title)
+        if error:
+            return False, error
+        if not task_item:
+            return False, "Task not found"
+
+        task_id = task_item.get("id")
+        if not task_id:
+            return False, "Task ID is missing"
+
+        _, error = google_tasks_request("DELETE", f"/lists/{task_list_id}/tasks/{task_id}")
+        if error:
+            return False, error
+
+        return True, str(task_item.get("title", task_title)).strip()
+
+    def update_google_task_title(old_title, new_title):
+        task_list_id, task_item, error = find_google_task_by_title(old_title)
+        if error:
+            return False, error
+        if not task_item:
+            return False, "Task not found"
+
+        task_id = task_item.get("id")
+        if not task_id:
+            return False, "Task ID is missing"
+
+        _, error = google_tasks_request(
+            "PATCH",
+            f"/lists/{task_list_id}/tasks/{task_id}",
+            params={"fields": "id,title,status"},
+            payload={"title": new_title},
+        )
+        if error:
+            return False, error
+
+        return True, str(task_item.get("title", old_title)).strip()
+
+    def complete_google_task(task_title):
+        task_list_id, task_item, error = find_google_task_by_title(task_title)
+        if error:
+            return False, error
+        if not task_item:
+            return False, "Task not found"
+
+        task_id = task_item.get("id")
+        if not task_id:
+            return False, "Task ID is missing"
+
+        completed_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        _, error = google_tasks_request(
+            "PATCH",
+            f"/lists/{task_list_id}/tasks/{task_id}",
+            params={"fields": "id,title,status,completed"},
+            payload={
+                "title": task_item.get("title", task_title),
+                "status": "completed",
+                "completed": completed_at,
+            },
+        )
+        if error:
+            return False, error
+
+        return True, str(task_item.get("title", task_title)).strip()
 
     def speak(text):
         if shutil.which("spd-say"):
@@ -556,6 +1115,70 @@ def main():
 
     def chat_reply(user_text):
         nonlocal voice_chat_history
+        nonlocal cached_local_model_name, cached_local_model_until
+        nonlocal cached_ollama_available, cached_ollama_available_until
+
+        def pick_local_chat_model(local_base_url, preferred_model):
+            nonlocal cached_local_model_name, cached_local_model_until
+
+            if preferred_model:
+                return preferred_model
+
+            now_ts = time.time()
+            if cached_local_model_name and now_ts < cached_local_model_until:
+                return cached_local_model_name
+
+            try:
+                response = requests.get(f"{local_base_url.rstrip('/')}/api/tags", timeout=3)
+                if not response.ok:
+                    return "llama3.2:3b"
+
+                payload = response.json()
+                items = payload.get("models", []) if isinstance(payload, dict) else []
+                installed = [str(item.get("name", "")).strip() for item in items if str(item.get("name", "")).strip()]
+                if not installed:
+                    return "llama3.2:3b"
+
+                priority = [
+                    "qwen2.5:7b",
+                    "llama3.1:8b",
+                    "mistral:7b",
+                    "phi4",
+                    "llama3.2:3b",
+                ]
+
+                installed_lower = {name.lower(): name for name in installed}
+                for candidate in priority:
+                    exact = installed_lower.get(candidate.lower())
+                    if exact:
+                        cached_local_model_name = exact
+                        cached_local_model_until = now_ts + MODEL_DISCOVERY_CACHE_SECONDS
+                        return exact
+
+                for candidate in priority:
+                    for existing in installed:
+                        if candidate.lower() in existing.lower():
+                            cached_local_model_name = existing
+                            cached_local_model_until = now_ts + MODEL_DISCOVERY_CACHE_SECONDS
+                            return existing
+
+                cached_local_model_name = installed[0]
+                cached_local_model_until = now_ts + MODEL_DISCOVERY_CACHE_SECONDS
+                return installed[0]
+            except Exception:
+                return "llama3.2:3b"
+
+        def fast_ollama_available(local_base_url):
+            nonlocal cached_ollama_available, cached_ollama_available_until
+
+            now_ts = time.time()
+            if now_ts < cached_ollama_available_until:
+                return cached_ollama_available
+
+            available = ollama_server_available(local_base_url)
+            cached_ollama_available = available
+            cached_ollama_available_until = now_ts + OLLAMA_STATUS_CACHE_SECONDS
+            return available
 
         def safe_eval_math(expression):
             try:
@@ -728,6 +1351,22 @@ def main():
             if any(phrase in lowered_text for phrase in ["how are you", "how are u", "what's up", "whats up"]):
                 return "I am running well and ready to help."
 
+            if any(
+                phrase in lowered_text
+                for phrase in [
+                    "how is your day",
+                    "how's your day",
+                    "how is the day going",
+                    "how's the day going",
+                    "how are things",
+                    "how is it going",
+                ]
+            ):
+                return "My day is going great. I am here with you and ready for anything you need. How is your day going?"
+
+            if any(phrase in lowered_text for phrase in ["good morning", "good afternoon", "good evening"]):
+                return "Great to hear from you. Hope your day is going smoothly."
+
             if any(phrase in lowered_text for phrase in ["who are you", "what are you", "your name", "who is this"]):
                 return "I am JARVIS, your IoT and voice assistant."
 
@@ -740,7 +1379,7 @@ def main():
             if any(phrase in lowered_text for phrase in ["what can you do", "help", "commands", "capabilities"]):
                 return (
                     "I can control Spotify, switch I O T and Spotify modes, adjust volume, "
-                    "and answer short questions."
+                    "manage Google Tasks, and answer short questions."
                 )
 
             if any(phrase in lowered_text for phrase in ["status", "system status", "are you online"]):
@@ -763,7 +1402,8 @@ def main():
             return "I am listening. You can ask a question or give a command."
 
         local_base = os.getenv("AI_LOCAL_API_BASE", "http://127.0.0.1:11434")
-        local_model = os.getenv("AI_LOCAL_MODEL", "llama3.2:3b")
+        configured_local_model = os.getenv("AI_LOCAL_MODEL", "").strip()
+        local_model = pick_local_chat_model(local_base, configured_local_model)
         api_key = os.getenv("AI_CHAT_API_KEY") or os.getenv("OPENAI_API_KEY")
         api_base = os.getenv("AI_CHAT_API_BASE", "https://api.openai.com/v1")
         model = os.getenv("AI_CHAT_MODEL", "gpt-4o-mini")
@@ -771,14 +1411,21 @@ def main():
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         system_prompt = (
-            "You are JARVIS: concise, helpful, and speak in short replies. "
-            "If live weather context is provided, use it directly and do not invent weather values. "
+            "You are JARVIS, warm, natural, and concise. "
+            "Reply in 1-3 short conversational lines. "
+            "For chit-chat, sound friendly and human, not robotic. "
+            "Use provided weather context exactly and do not invent weather values. "
             f"Current local datetime is {now_text}."
         )
 
         prompt_text = user_text if not weather_info else f"{user_text}\n\nContext: {weather_info}"
-        local_available = ensure_ollama_server_running(local_base)
-        messages = [{"role": "system", "content": system_prompt}] + voice_chat_history + [
+        local_available = fast_ollama_available(local_base)
+        if not local_available:
+            local_available = ensure_ollama_server_running(local_base)
+
+        history_window = 8 if VOICE_FAST_MODE else MAX_CHAT_HISTORY_MESSAGES
+        chat_context = voice_chat_history[-history_window:]
+        messages = [{"role": "system", "content": system_prompt}] + chat_context + [
             {"role": "user", "content": prompt_text}
         ]
 
@@ -820,8 +1467,8 @@ def main():
                     json={
                         "model": model,
                         "messages": messages,
-                        "temperature": 0.7,
-                        "max_tokens": 120,
+                        "temperature": 0.6,
+                        "max_tokens": 120 if VOICE_FAST_MODE else 180,
                     },
                     timeout=20,
                 )
@@ -857,8 +1504,8 @@ def main():
     def handle_voice_command(text):
         nonlocal voice_last_command, voice_enabled, last_volume_level, voice_listener
 
-        command = text.strip().lower()
-        command = re.sub(r"^\s*jarvis\b[\s,.:;-]*", "", command).strip()
+        raw_command = re.sub(r"^\s*jarvis\b[\s,.:;-]*", "", text.strip(), flags=re.IGNORECASE).strip()
+        command = raw_command.lower()
         print(f"Voice command: {command}")
 
         if not command:
@@ -891,6 +1538,143 @@ def main():
             reply("Spotify mode")
             return
 
+        if command in {"list profiles", "show profiles", "available profiles"}:
+            names = ", ".join(sorted(profile_config.get("profiles", {}).keys()))
+            reply(f"Available profiles are {names}. Active profile is {get_active_profile_name()}.")
+            return
+
+        name_match = re.search(r"(?:^|\b)(?:my\s+name\s+is|i\s+am|i\'m|this\s+is)\s+(.+)$", command)
+        if name_match:
+            captured_name = name_match.group(1)
+            captured_name = re.sub(r"[^a-z0-9_\-\s]", " ", captured_name.lower())
+            captured_name = " ".join(captured_name.split())
+            created, profile_name = ensure_profile_from_name(captured_name)
+            if created is None:
+                reply(profile_name)
+            elif created:
+                reply(f"Nice to meet you {profile_name}. Your profile is ready.")
+            else:
+                reply(f"Welcome back {profile_name}. Profile activated.")
+            return
+
+        profile_match = re.search(r"(?:switch to|use|set)\s+(?:profile\s+)?([a-z0-9_\- ]{2,30})$", command)
+        if profile_match:
+            requested = profile_match.group(1).strip()
+            profile_key = resolve_profile_key(requested)
+            if profile_key:
+                changed = switch_profile(profile_key)
+                if changed:
+                    reply(f"Switched to {get_active_profile_name()} profile")
+                else:
+                    reply(f"{get_active_profile_name()} profile is already active")
+            else:
+                reply("Profile not found")
+            return
+
+        if re.search(r"^(?:list|show)\s+(?:my\s+)?(?:google\s+)?tasks\b", command):
+            if not google_tasks_configured():
+                reply("Google Tasks is not configured")
+                return
+
+            tasks, error = list_google_tasks(limit=5)
+            if error:
+                reply(error)
+                return
+            if not tasks:
+                reply("No pending tasks")
+                return
+            reply("Top tasks: " + ", ".join(tasks[:3]))
+            return
+
+        add_task_match = re.search(
+            r"^(?:add|create|new)\s+(?:a\s+)?(?:google\s+)?task\b[:\s\-]*(.+)$",
+            raw_command,
+            re.IGNORECASE,
+        )
+        if add_task_match:
+            if not google_tasks_configured():
+                reply("Google Tasks is not configured")
+                return
+
+            task_title = normalize_task_text(add_task_match.group(1))
+            if not task_title:
+                reply("Please say the task title")
+                return
+
+            created_title, error = create_google_task(task_title)
+            if error:
+                reply(error)
+            else:
+                reply(f"Task added: {created_title}")
+            return
+
+        delete_task_match = re.search(
+            r"^(?:delete|del|remove)\s+(?:the\s+)?(?:google\s+)?task\b[:\s\-]*(.+)$",
+            raw_command,
+            re.IGNORECASE,
+        )
+        if delete_task_match:
+            if not google_tasks_configured():
+                reply("Google Tasks is not configured")
+                return
+
+            task_title = normalize_task_text(delete_task_match.group(1))
+            if not task_title:
+                reply("Please say which task to delete")
+                return
+
+            deleted, info = delete_google_task(task_title)
+            if deleted:
+                reply(f"Task deleted: {info}")
+            else:
+                reply(info)
+            return
+
+        update_task_match = re.search(
+            r"^(?:update|edit|rename)\s+(?:the\s+)?(?:google\s+)?task\b[:\s\-]*(.+?)\s+(?:to|as)\s+(.+)$",
+            raw_command,
+            re.IGNORECASE,
+        )
+        if update_task_match:
+            if not google_tasks_configured():
+                reply("Google Tasks is not configured")
+                return
+
+            old_title = normalize_task_text(update_task_match.group(1))
+            new_title = normalize_task_text(update_task_match.group(2))
+            if not old_title or not new_title:
+                reply("Please say old and new task titles")
+                return
+
+            updated, info = update_google_task_title(old_title, new_title)
+            if updated:
+                reply(f"Task updated: {old_title} to {new_title}")
+            else:
+                reply(info)
+            return
+
+        complete_task_match = re.search(
+            r"^(?:complete|finish|done|mark)\s+(?:the\s+)?(?:google\s+)?task\b[:\s\-]*(.+)$",
+            raw_command,
+            re.IGNORECASE,
+        )
+        if complete_task_match:
+            if not google_tasks_configured():
+                reply("Google Tasks is not configured")
+                return
+
+            task_title = normalize_task_text(complete_task_match.group(1))
+            if not task_title:
+                reply("Please say which task to complete")
+                return
+
+            completed, info = complete_google_task(task_title)
+            if completed:
+                reply(f"Task completed: {info}")
+            else:
+                reply(info)
+            return
+
         if command in {"play", "resume", "start playback"} or "play music" in command:
             if current_mode != "SPOTIFY":
                 set_mode("SPOTIFY")
@@ -920,14 +1704,16 @@ def main():
             return
 
         if "volume up" in command or "raise volume" in command or "louder" in command:
-            level = 60 if last_volume_level is None else min(100, last_volume_level + 10)
+            volume_cfg = profile_volume_settings()
+            level = volume_cfg["up_start"] if last_volume_level is None else min(100, last_volume_level + volume_cfg["step"])
             last_volume_level = level
             spotify_set_volume(level)
             reply(f"Volume {level} percent")
             return
 
         if "volume down" in command or "lower volume" in command or "softer" in command:
-            level = 40 if last_volume_level is None else max(0, last_volume_level - 10)
+            volume_cfg = profile_volume_settings()
+            level = volume_cfg["down_start"] if last_volume_level is None else max(0, last_volume_level - volume_cfg["step"])
             last_volume_level = level
             spotify_set_volume(level)
             reply(f"Volume {level} percent")
@@ -989,6 +1775,14 @@ def main():
             print(f"Camera read failed on index {camera_index}. Closing app.")
             break
 
+        fps_counter += 1
+        fps_now = time.time()
+        fps_elapsed = fps_now - fps_last_time
+        if fps_elapsed >= 0.5:
+            fps_value = fps_counter / fps_elapsed
+            fps_counter = 0
+            fps_last_time = fps_now
+
         frame = cv2.flip(frame, 1)
         h, w, _ = frame.shape
 
@@ -1012,8 +1806,19 @@ def main():
         jarvis_render_targets = []
 
         if results.multi_hand_landmarks:
-            for hl_all in results.multi_hand_landmarks:
-                mp_draw.draw_landmarks(frame, hl_all, mp_hands.HAND_CONNECTIONS)
+            for hand_index, hl_all in enumerate(results.multi_hand_landmarks):
+                warm_theme = warm_palette_for_hand(hand_index)
+                landmark_color = (120, 220, 255) if warm_theme else (255, 220, 120)
+                connector_color = (95, 175, 235) if warm_theme else (210, 170, 70)
+                landmark_style = mp_draw.DrawingSpec(color=landmark_color, thickness=2, circle_radius=2)
+                connector_style = mp_draw.DrawingSpec(color=connector_color, thickness=2, circle_radius=1)
+                mp_draw.draw_landmarks(
+                    frame,
+                    hl_all,
+                    mp_hands.HAND_CONNECTIONS,
+                    landmark_style,
+                    connector_style,
+                )
                 lm_all = hl_all.landmark
 
                 detected_count_all = count_raised_fingers(lm_all)
@@ -1130,8 +1935,13 @@ def main():
                                 pygame.mixer.stop()
                                 sys.exit()
                     elif pinch_detected:
-                        gesture_name = "PINCH/SPARKLE"
-                        cmd = "P"
+                        pinch_action = iot_action_for_detection(detected_count, True)
+                        if pinch_action:
+                            gesture_name = pinch_action["label"]
+                            cmd = pinch_action["command"] or "P"
+                        else:
+                            gesture_name = "PINCH/SPARKLE"
+                            cmd = "P"
                         pinch_active = True
 
                         for _ in range(3):
@@ -1145,15 +1955,13 @@ def main():
                                 (0, 255, 255),
                                 -1,
                             )
-                    elif detected_count == 1:
-                        gesture_name, cmd = "ONE", "1"
-                    elif detected_count == 2:
-                        gesture_name, cmd = "TWO", "2"
-                    elif detected_count == 3:
-                        gesture_name, cmd = "THREE", "3"
-                    elif detected_count == 5:
-                        gesture_name = "JARVIS"
-                        jarvis_active = True
+                    else:
+                        iot_action = iot_action_for_detection(detected_count, False)
+                        if iot_action:
+                            gesture_name = iot_action["label"]
+                            if iot_action["command"]:
+                                cmd = iot_action["command"]
+                            jarvis_active = bool(iot_action["jarvis"])
 
             if current_mode == "SPOTIFY" and not voice_enabled:
                 display_mode = current_mode
@@ -1180,13 +1988,7 @@ def main():
                 else:
                     spotify_exit_start_time = 0
                     now = time.time()
-                    gesture_map = {
-                        1: ("play", "PLAY", spotify_play_only),
-                        2: ("pause", "PAUSE", spotify_pause_only),
-                        3: ("prev", "PREVIOUS TRACK", spotify_previous_track),
-                        4: ("next", "NEXT TRACK", spotify_next_track),
-                    }
-                    mapped = gesture_map.get(detected_count)
+                    mapped = spotify_action_for_count(detected_count)
 
                     if not mapped:
                         gesture_name = "SPOTIFY READY"
@@ -1244,7 +2046,7 @@ def main():
                 bridge_strength = max(0.2, min(1.0, bridge_len / max(1, w * 0.62)))
                 bridge_phase = time.time() * 6.0
 
-                for strand in range(4):
+                for strand in range(render_tuning["bridge_strands"]):
                     wave = int((strand - 1.5) * 4 + 8 * math.sin(bridge_phase + strand * 1.1))
                     p1 = (left_center[0], left_center[1] + wave)
                     p2 = (right_center[0], right_center[1] - wave)
@@ -1256,7 +2058,7 @@ def main():
                     (left_center[0] + right_center[0]) // 2,
                     (left_center[1] + right_center[1]) // 2,
                 )
-                for n in range(3):
+                for n in range(render_tuning["bridge_rings"]):
                     wave_r = int(22 + n * 16 + 6 * math.sin(bridge_phase + n * 1.3))
                     cv2.ellipse(
                         bridge_overlay,
@@ -1269,7 +2071,7 @@ def main():
                         1,
                     )
 
-                steps = 10
+                steps = render_tuning["bridge_steps"]
                 for step in range(1, steps):
                     blend = step / steps
                     px = int(left_center[0] * (1 - blend) + right_center[0] * blend)
@@ -1292,7 +2094,8 @@ def main():
                 sweep = ((render_angle + phase * 32) * 1.8 + t * sweep_speed) % 360
                 twinkle = 0.5 + 0.5 * math.sin((t + phase) * 8.2)
 
-                if idx % 2 == 0:
+                warm_theme = warm_palette_for_hand(idx)
+                if warm_theme:
                     neon_core = (255, 220, 60)
                     neon_ring = (255, 200, 70)
                     neon_soft = (170, 120, 35)
@@ -1318,7 +2121,7 @@ def main():
                 inner_r = int((78 + 3 * pulse) * dynamic_scale)
 
                 cv2.circle(frame, center, outer_r, steel, 1)
-                cv2.circle(frame, center, mid_r, (120, 140, 170) if idx % 2 == 0 else (130, 180, 215), 2)
+                cv2.circle(frame, center, mid_r, (120, 140, 170) if warm_theme else (130, 180, 215), 2)
                 cv2.circle(frame, center, inner_r, neon_soft, 1)
 
                 # Soft crosshair bloom at center.
@@ -1338,7 +2141,7 @@ def main():
                     1,
                 )
 
-                for i in range(0, 360, 10):
+                for i in range(0, 360, render_tuning["tick_step"]):
                     ang = math.radians(i + sweep * 0.35)
                     x1 = int(center[0] + (inner_r + 8) * math.cos(ang))
                     y1 = int(center[1] + (inner_r + 8) * math.sin(ang))
@@ -1349,10 +2152,10 @@ def main():
                 # Rotating segmented arcs for a more premium scanner look.
                 arc_sets = [
                     (outer_r - 10, sweep, 58, neon_ring, 2),
-                    (outer_r - 10, sweep + 165, 42, (200, 165, 65) if idx % 2 == 0 else (115, 195, 230), 2),
+                    (outer_r - 10, sweep + 165, 42, (200, 165, 65) if warm_theme else (115, 195, 230), 2),
                     (mid_r - 8, -sweep * 1.2, 68, neon_core, 2),
-                    (mid_r - 8, -sweep * 1.2 + 205, 34, (190, 145, 55) if idx % 2 == 0 else (90, 170, 210), 2),
-                    (inner_r - 8, sweep * 1.6, 85, (255, 235, 120) if idx % 2 == 0 else (175, 245, 255), 2),
+                    (mid_r - 8, -sweep * 1.2 + 205, 34, (190, 145, 55) if warm_theme else (90, 170, 210), 2),
+                    (inner_r - 8, sweep * 1.6, 85, (255, 235, 120) if warm_theme else (175, 245, 255), 2),
                 ]
                 for radius, start, span, color, thick in arc_sets:
                     cv2.ellipse(frame, center, (radius, radius), 0, start, start + span, color, thick)
@@ -1365,7 +2168,7 @@ def main():
                     sweep * 0.45,
                     30,
                     310,
-                    (140, 175, 230) if idx % 2 == 0 else (120, 220, 255),
+                    (140, 175, 230) if warm_theme else (120, 220, 255),
                     1,
                 )
                 cv2.ellipse(
@@ -1375,7 +2178,7 @@ def main():
                     -sweep * 0.75,
                     0,
                     260,
-                    (255, 210, 110) if idx % 2 == 0 else (135, 230, 255),
+                    (255, 210, 110) if warm_theme else (135, 230, 255),
                     1,
                 )
                 cv2.ellipse(
@@ -1385,7 +2188,7 @@ def main():
                     sweep * 1.2,
                     80,
                     360,
-                    (255, 240, 150) if idx % 2 == 0 else (190, 250, 255),
+                    (255, 240, 150) if warm_theme else (190, 250, 255),
                     1,
                 )
 
@@ -1396,21 +2199,21 @@ def main():
                     gx = int(center[0] + glint_r * math.cos(ang))
                     gy = int(center[1] + glint_r * math.sin(ang))
                     glow_size = 3 if (offset == 0 and twinkle > 0.65) else 2
-                    cv2.circle(frame, (gx, gy), glow_size, (255, 235, 150) if idx % 2 == 0 else (190, 245, 255), -1)
+                    cv2.circle(frame, (gx, gy), glow_size, (255, 235, 150) if warm_theme else (190, 245, 255), -1)
 
                 # Sweep beam accent.
                 beam_ang = math.radians(sweep)
                 bx = int(center[0] + (outer_r - 14) * math.cos(beam_ang))
                 by = int(center[1] + (outer_r - 14) * math.sin(beam_ang))
-                cv2.line(frame, center, (bx, by), (255, 230, 120) if idx % 2 == 0 else (150, 240, 255), 2)
-                cv2.circle(frame, (bx, by), 5, (255, 235, 145) if idx % 2 == 0 else (205, 250, 255), -1)
+                cv2.line(frame, center, (bx, by), (255, 230, 120) if warm_theme else (150, 240, 255), 2)
+                cv2.circle(frame, (bx, by), 5, (255, 235, 145) if warm_theme else (205, 250, 255), -1)
 
                 # Beam trail for more cinematic motion.
-                for trail_idx in range(1, 4):
+                for trail_idx in range(1, render_tuning["trail_layers"] + 1):
                     trail_ang = math.radians(sweep - trail_idx * 8)
                     tx = int(center[0] + (outer_r - 18 - trail_idx * 3) * math.cos(trail_ang))
                     ty = int(center[1] + (outer_r - 18 - trail_idx * 3) * math.sin(trail_ang))
-                    if idx % 2 == 0:
+                    if warm_theme:
                         trail_color = (210 - trail_idx * 30, 180 - trail_idx * 20, 110 - trail_idx * 15)
                     else:
                         trail_color = (130 - trail_idx * 14, 210 - trail_idx * 22, 235 - trail_idx * 20)
@@ -1419,7 +2222,7 @@ def main():
                 core_outer = int((39 + 3 * pulse) * dynamic_scale)
                 core_inner = int((18 + 2 * pulse) * dynamic_scale)
                 cv2.circle(frame, center, core_outer, neon_ring, 2)
-                cv2.circle(frame, center, core_inner + 8, (255, 245, 185) if idx % 2 == 0 else (205, 250, 255), -1)
+                cv2.circle(frame, center, core_inner + 8, (255, 245, 185) if warm_theme else (205, 250, 255), -1)
                 cv2.circle(frame, center, core_inner, (255, 255, 255), -1)
 
                 # Inner rotating triangle and braces for a HUD-like look.
@@ -1433,7 +2236,7 @@ def main():
                             int(center[1] + tri_r * math.sin(tri_ang)),
                         ]
                     )
-                cv2.polylines(frame, [np.array(tri_pts, np.int32)], True, (255, 225, 120) if idx % 2 == 0 else (170, 245, 255), 1)
+                cv2.polylines(frame, [np.array(tri_pts, np.int32)], True, (255, 225, 120) if warm_theme else (170, 245, 255), 1)
 
                 brace_r = inner_r - 18
                 for angle_offset in (45, 135, 225, 315):
@@ -1442,7 +2245,7 @@ def main():
                     by1 = int(center[1] + brace_r * math.sin(a))
                     bx2 = int(center[0] + (brace_r + 10) * math.cos(a))
                     by2 = int(center[1] + (brace_r + 10) * math.sin(a))
-                    cv2.line(frame, (bx1, by1), (bx2, by2), (210, 175, 90) if idx % 2 == 0 else (120, 210, 245), 2)
+                    cv2.line(frame, (bx1, by1), (bx2, by2), (210, 175, 90) if warm_theme else (120, 210, 245), 2)
 
                 hex_pts = []
                 for i in range(6):
@@ -1450,7 +2253,7 @@ def main():
                     x = int(center[0] + (core_inner + 14) * math.cos(ang))
                     y = int(center[1] + (core_inner + 14) * math.sin(ang))
                     hex_pts.append([x, y])
-                cv2.polylines(frame, [np.array(hex_pts, np.int32)], True, (255, 220, 95) if idx % 2 == 0 else (150, 240, 255), 2)
+                cv2.polylines(frame, [np.array(hex_pts, np.int32)], True, (255, 220, 95) if warm_theme else (150, 240, 255), 2)
 
                 for i in range(12):
                     ang = math.radians(i * 30 + sweep * 0.55)
@@ -1458,28 +2261,28 @@ def main():
                     x = int(center[0] + r * math.cos(ang))
                     y = int(center[1] + r * math.sin(ang))
                     size = 2 if i % 2 == 0 else 3
-                    cv2.circle(frame, (x, y), size, (230, 195, 85) if idx % 2 == 0 else (130, 220, 250), -1)
+                    cv2.circle(frame, (x, y), size, (230, 195, 85) if warm_theme else (130, 220, 250), -1)
 
                 # Micro particles that shimmer near the outer ring.
-                particle_count = int(6 + 6 * twinkle)
+                particle_count = int(render_tuning["particles_base"] + render_tuning["particles_amp"] * twinkle)
                 for i in range(particle_count):
                     p_ang = math.radians((sweep * 1.6 + i * (360 / max(1, particle_count))) % 360)
                     p_r = outer_r + 8 + (i % 3) * 3
                     px = int(center[0] + p_r * math.cos(p_ang))
                     py = int(center[1] + p_r * math.sin(p_ang))
-                    cv2.circle(frame, (px, py), 1, (255, 240, 170) if idx % 2 == 0 else (190, 248, 255), -1)
+                    cv2.circle(frame, (px, py), 1, (255, 240, 170) if warm_theme else (190, 248, 255), -1)
 
                 # Cinematic wave shell and rotating chevrons.
                 shell_overlay = frame.copy()
                 shell_r = outer_r + 18
-                for band in range(3):
+                for band in range(render_tuning["shell_bands"]):
                     start_ang = (sweep * (1.2 + band * 0.18) + band * 80) % 360
                     span = 52 + band * 16
-                    shell_color = (145 + band * 30, 170 + band * 18, 245 - band * 20) if idx % 2 else (250 - band * 22, 205 - band * 14, 120 - band * 12)
+                    shell_color = (145 + band * 30, 170 + band * 18, 245 - band * 20) if not warm_theme else (250 - band * 22, 205 - band * 14, 120 - band * 12)
                     cv2.ellipse(shell_overlay, center, (shell_r + band * 8, shell_r + band * 8), 0, start_ang, start_ang + span, shell_color, 2)
                 cv2.addWeighted(shell_overlay, 0.20, frame, 0.80, 0, frame)
 
-                for k in range(8):
+                for k in range(render_tuning["chevrons"]):
                     ang = math.radians((sweep * 0.9 + k * 45) % 360)
                     base_r = inner_r + 18
                     p1 = (
@@ -1494,10 +2297,10 @@ def main():
                         int(center[0] + (base_r + 12) * math.cos(ang - 0.08)),
                         int(center[1] + (base_r + 12) * math.sin(ang - 0.08)),
                     )
-                    cv2.polylines(frame, [np.array([p1, p2, p3], np.int32)], True, (245, 220, 140) if idx % 2 == 0 else (170, 245, 255), 1)
+                    cv2.polylines(frame, [np.array([p1, p2, p3], np.int32)], True, (245, 220, 140) if warm_theme else (170, 245, 255), 1)
 
                 # Radial flicker lines to amplify reactor energy.
-                for ray in range(16):
+                for ray in range(render_tuning["rays"]):
                     a = math.radians(ray * 22.5 + sweep * 0.55)
                     r1 = core_inner + 6
                     r2 = inner_r - 6
@@ -1506,16 +2309,16 @@ def main():
                     rx2 = int(center[0] + r2 * math.cos(a))
                     ry2 = int(center[1] + r2 * math.sin(a))
                     if ray % 2 == 0:
-                        cv2.line(frame, (rx1, ry1), (rx2, ry2), (180, 175, 130) if idx % 2 == 0 else (140, 210, 230), 1)
+                        cv2.line(frame, (rx1, ry1), (rx2, ry2), (180, 175, 130) if warm_theme else (140, 210, 230), 1)
 
                 # Trailing afterimage for faster perceived motion.
                 trail_overlay = frame.copy()
-                for trail in range(1, 4):
+                for trail in range(1, render_tuning["trail_layers"] + 1):
                     ta = math.radians(sweep - trail * 14)
                     tr = outer_r - 24
                     tx = int(center[0] + tr * math.cos(ta))
                     ty = int(center[1] + tr * math.sin(ta))
-                    cv2.circle(trail_overlay, (tx, ty), max(2, 6 - trail), (255, 230, 150) if idx % 2 == 0 else (180, 245, 255), -1)
+                    cv2.circle(trail_overlay, (tx, ty), max(2, 6 - trail), (255, 230, 150) if warm_theme else (180, 245, 255), -1)
                 cv2.addWeighted(trail_overlay, 0.18, frame, 0.82, 0, frame)
 
                 # Finger energy threads that stretch with palm-to-fingertip distance.
@@ -1534,7 +2337,7 @@ def main():
                     phase_base = t * (8.0 + finger_i * 0.65) + finger_i * 0.9 + phase
 
                     points = []
-                    segments = 13
+                    segments = render_tuning["thread_segments"]
                     for s in range(segments + 1):
                         u = s / segments
                         bx = center[0] + dx_tip * u
@@ -1546,8 +2349,8 @@ def main():
                         py = int(by + perp_y * wave)
                         points.append([px, py])
 
-                    thread_color = (255, 220, 120) if idx % 2 == 0 else (160, 245, 255)
-                    glow_color = (210, 175, 90) if idx % 2 == 0 else (115, 205, 240)
+                    thread_color = (255, 220, 120) if warm_theme else (160, 245, 255)
+                    glow_color = (210, 175, 90) if warm_theme else (115, 205, 240)
                     cv2.polylines(thread_overlay, [np.array(points, np.int32)], False, glow_color, 3)
                     cv2.polylines(thread_overlay, [np.array(points, np.int32)], False, thread_color, 1)
 
@@ -1578,7 +2381,7 @@ def main():
                     (center[0] - 33, center[1] + outer_r + 21),
                     cv2.FONT_HERSHEY_DUPLEX,
                     0.56,
-                    (250, 230, 150),
+                    (250, 230, 150) if warm_theme else (185, 245, 255),
                     2,
                 )
 
@@ -1640,6 +2443,15 @@ def main():
 
         cv2.putText(frame, "JARVIS CONTROL HUD", (18, 30), 1, 1.0, (240, 240, 255), 2)
         cv2.line(frame, (18, 36), (260, 36), (90, 140, 255), 2)
+        cv2.putText(
+            frame,
+            f"BUILD {app_build_tag}  THEME {visual_theme.upper()}  RENDER {render_quality.upper()}",
+            (18, 54),
+            1,
+            0.64,
+            (164, 184, 230),
+            1,
+        )
 
         cv2.putText(frame, f"MODE", (20, 68), 1, 0.9, (165, 190, 240), 2)
         cv2.putText(frame, f"{display_mode}", (130, 68), 1, 1.1, mode_color, 2)
@@ -1660,6 +2472,9 @@ def main():
         cv2.putText(frame, "REPLY", (20, 238), 1, 0.9, (165, 190, 240), 2)
         cv2.putText(frame, f"{voice_last_command[:48]}", (130, 238), 1, 0.9, (210, 210, 210), 2)
 
+        cv2.putText(frame, "PROFILE", (20, 272), 1, 0.9, (165, 190, 240), 2)
+        cv2.putText(frame, f"{get_active_profile_name()}", (130, 272), 1, 0.9, (210, 210, 210), 2)
+
         panel_x = max(20, w - 306)
         panel_y = 18
         panel_w = 286
@@ -1677,6 +2492,10 @@ def main():
             cv2.putText(frame, f"{key}", (panel_x + 14, y), 1, 0.9, (220, 220, 220), 2)
             cv2.putText(frame, ":", (panel_x + 124, y), 1, 0.9, (140, 140, 140), 2)
             cv2.putText(frame, label, (panel_x + 150, y), 1, 0.9, status_color, 2)
+
+        if show_fps:
+            fps_text = f"FPS {fps_value:0.1f}"
+            cv2.putText(frame, fps_text, (panel_x + 176, panel_y + panel_h + 24), 1, 0.85, (145, 220, 255), 2)
 
         bottom_hint = "Press V: Voice Toggle   Esc: Exit"
         cv2.putText(frame, bottom_hint, (18, h - 22), 1, 0.8, (185, 200, 240), 2)
