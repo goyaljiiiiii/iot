@@ -29,7 +29,7 @@ dependencies = [
   "pyserial==3.5",
   "sounddevice==0.5.5",
   "SpeechRecognition==3.16.0",
-  "spotipy==2.25.1",
+  "spotipy==2.25.2",
 ]
 
 [project.scripts]
