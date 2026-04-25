@@ -147,3 +147,7 @@ python scripts/serial_command_test.py
 ## Contributing
 
 See `CONTRIBUTING.md`.
+
+## Activate the env
+
+source myenv/bin/activate

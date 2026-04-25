@@ -89,7 +89,11 @@ class VoiceCommandListener:
                     continue
 
                 audio = sr.AudioData(samples.tobytes(), self.sample_rate, 2)
-                text = self.recognizer.recognize_google(audio).strip().lower()
+                try:
+                    text = self.recognizer.recognize_google(audio).strip().lower()
+                except sr.RequestError:
+                    # Fallback to offline speech recognition if internet/DNS is unavailable
+                    text = self.recognizer.recognize_sphinx(audio).strip().lower()
 
                 if text:
                     now = time.time()
