@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "iot-gesture-controller"
+name = "jarvis-gesture-voice"
 version = "0.1.0"
-description = "Hand-gesture based IoT and Spotify controller"
+description = "Hand-gesture, voice, and Spotify controller"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Your Name" }]
-keywords = ["iot", "gesture-control", "opencv", "mediapipe", "spotify", "voice-assistant"]
+keywords = ["gesture-control", "opencv", "mediapipe", "spotify", "voice-assistant", "jarvis"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -19,22 +19,22 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Operating System :: POSIX :: Linux",
-  "Topic :: Home Automation",
+  "Topic :: Multimedia :: Sound/Audio",
 ]
 dependencies = [
   "mediapipe==0.10.14",
   "numpy==2.4.4",
   "opencv-python==4.13.0.92",
   "pygame==2.6.1",
-  "pyserial==3.5",
+  "mss",
   "sounddevice==0.5.5",
   "SpeechRecognition==3.16.0",
   "spotipy==2.25.1",
 ]
 
 [project.scripts]
-iot-gesture = "iot_control.gesture:main"
+jarvis-gesture = "jarvis_control.gesture:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["iot_control*"]
+include = ["jarvis_control*"]

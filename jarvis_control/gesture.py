@@ -1,3 +1,12 @@
+"""
+JARVIS Gesture + Voice Controller
+
+Teaching path (small, focused scripts):
+- Lesson 01: `lessons/lesson_01_open_camera.py`
+- Lesson 02: `lessons/lesson_02_count_fingers.py`
+- Lesson 03: `lessons/lesson_03_two_finger_screenshot.py`
+"""
+
 import glob
 import ast
 import json
@@ -18,15 +27,14 @@ import mediapipe as mp
 import numpy as np
 import pygame
 import requests
-import serial
 
 try:
     import sounddevice as sd
 except Exception:
     sd = None
 
-from iot_control.spotify import create_spotify_client
-from iot_control.voice import VoiceCommandListener
+from jarvis_control.spotify import create_spotify_client
+from jarvis_control.voice import VoiceCommandListener
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -38,11 +46,9 @@ DEFAULT_PROFILE_CONFIG = {
     "profiles": {
         "default": {
             "display_name": "Default",
-            "iot_gestures": {
-                "pinch": {"label": "PINCH/SPARKLE", "command": "P"},
-                "1": {"label": "ONE", "command": "1"},
-                "2": {"label": "TWO", "command": "2"},
-                "3": {"label": "THREE", "command": "3"},
+            "gesture_mode_gestures": {
+                "pinch": {"label": "PINCH/SPARKLE"},
+                "2": {"label": "SCREENSHOT", "screenshot": True},
                 "5": {"label": "JARVIS", "jarvis": True},
             },
             "spotify_gestures": {
@@ -94,8 +100,17 @@ def main():
         else:
             print("Spotify controls are unavailable. Install playerctl or configure Spotify API credentials.")
 
-    pygame.mixer.pre_init(44100, -16, 2, 512)
-    pygame.mixer.init()
+    audio_available = True
+    try:
+        pygame.mixer.pre_init(44100, -16, 2, 512)
+        pygame.mixer.init()
+    except Exception as exc:
+        audio_available = False
+        try:
+            pygame.mixer.quit()
+        except Exception:
+            pass
+        print(f"Audio disabled: {exc}")
 
     def safe_spotify_call(action, label):
         if not sp:
@@ -286,13 +301,50 @@ def main():
         print("Mute toggle requires pactl on this setup.")
         return False
 
-    sound_count = load_sound("count.mp3")
-    sound_click = load_sound("click.mp3")
-    sound_sparkle = load_sound("sparkle.mp3")
-    sound_jarvis = load_sound("jarvis.wav")
+    sound_count = load_sound("count.mp3") if audio_available else None
+    sound_click = load_sound("click.mp3") if audio_available else None
+    sound_sparkle = load_sound("sparkle.mp3") if audio_available else None
+    sound_jarvis = load_sound("jarvis.wav") if audio_available else None
 
-    ports = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
-    arduino = serial.Serial(ports[0], 9600, timeout=0) if ports else None
+    screenshots_dir = Path(os.getenv("SCREENSHOTS_DIR", str(ROOT_DIR / "screenshots"))).expanduser()
+    screenshot_cooldown_seconds = float(os.getenv("SCREENSHOT_COOLDOWN_SECONDS", "1.25"))
+    last_screenshot_time = 0.0
+    screenshot_wait_release = False
+
+    def take_screenshot(_frame_bgr):
+        nonlocal last_screenshot_time, screenshot_wait_release
+
+        now_ts = time.time()
+        if screenshot_wait_release:
+            return None
+        if now_ts - last_screenshot_time < screenshot_cooldown_seconds:
+            return None
+
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        filename = datetime.now().strftime("jarvis_%Y%m%d_%H%M%S_%f")[:-3] + ".png"
+        out_path = screenshots_dir / filename
+        ok = False
+
+        try:
+            import mss
+            import mss.tools
+
+            with mss.mss() as sct:
+                monitor = sct.monitors[0]  # all monitors
+                grab = sct.grab(monitor)
+                png_bytes = mss.tools.to_png(grab.rgb, grab.size)
+                out_path.write_bytes(png_bytes)
+                ok = True
+        except Exception:
+            ok = False
+
+        if not ok:
+            return None
+
+        last_screenshot_time = now_ts
+        screenshot_wait_release = True
+        print(f"Saved screenshot: {out_path}")
+        return str(out_path)
 
     mp_hands = mp.solutions.hands
     mp_draw = mp.solutions.drawing_utils
@@ -344,11 +396,10 @@ def main():
         return
 
     canvas = None
-    last_sent = ""
     fist_start_time = 0
     is_sparkle_playing = False
     is_jarvis_playing = False
-    current_mode = "IOT"
+    current_mode = "GESTURE"
     spotify_trigger_time = 0
     spotify_exit_start_time = 0
     last_pinch_state = False
@@ -378,12 +429,7 @@ def main():
     cached_ollama_available = False
     cached_ollama_available_until = 0.0
     startup_checks_last_refresh = 0.0
-    startup_checks = {
-        "MIC": False,
-        "OLLAMA": False,
-        "SPOTIFY": False,
-        "ARDUINO": False,
-    }
+    startup_checks = {"MIC": False, "OLLAMA": False, "SPOTIFY": False}
     jarvis_distance_scale = 1.0
     jarvis_height_factor = 1.0
     profile_config = {}
@@ -599,28 +645,24 @@ def main():
             "step": max(1, min(40, step)),
         }
 
-    def iot_action_for_detection(detected_count_value, is_pinch):
-        gestures = get_active_profile_config().get("iot_gestures", {})
+    def gesture_mode_action_for_detection(detected_count_value, is_pinch):
+        gestures = get_active_profile_config().get("gesture_mode_gestures", {})
         key = "pinch" if is_pinch else str(detected_count_value)
         action = gestures.get(key)
         if not isinstance(action, dict):
             return None
 
         label = action.get("label")
-        command = action.get("command")
         jarvis = bool(action.get("jarvis", False))
+        screenshot = bool(action.get("screenshot", False))
 
         if not isinstance(label, str) or not label.strip():
             return None
 
-        command_str = ""
-        if isinstance(command, str):
-            command_str = command.strip()
-
         return {
             "label": label.strip(),
-            "command": command_str,
             "jarvis": jarvis,
+            "screenshot": screenshot,
         }
 
     def spotify_action_for_count(detected_count_value):
@@ -718,7 +760,6 @@ def main():
             "MIC": microphone_available(),
             "OLLAMA": ollama_server_available(local_base),
             "SPOTIFY": bool(sp or playerctl_available),
-            "ARDUINO": arduino is not None,
         }
 
     def google_tasks_configured():
@@ -1044,24 +1085,6 @@ def main():
 
         return count
 
-    def send_arduino(command):
-        nonlocal last_sent
-
-        if not arduino or not command:
-            return
-
-        if command == last_sent:
-            return
-
-        try:
-            arduino.write(command.encode())
-            last_sent = command
-            print(f"Sent to Arduino: {command}")
-            if command != "0" and sound_click:
-                sound_click.play()
-        except Exception as e:
-            print(f"Arduino Error: {e}")
-
     def launch_spotify_app():
         candidates = [
             ["xdg-open", "https://open.spotify.com/"],
@@ -1086,7 +1109,7 @@ def main():
         return False
 
     def set_mode(mode):
-        nonlocal current_mode, spotify_trigger_time, spotify_exit_start_time, last_sent, last_volume_level, last_spotify_gesture, spotify_launch_attempted
+        nonlocal current_mode, spotify_trigger_time, spotify_exit_start_time, last_volume_level, last_spotify_gesture, spotify_launch_attempted
         nonlocal spotify_pending_gesture, spotify_pending_since, spotify_last_action_time, spotify_wait_release
 
         if current_mode == mode:
@@ -1095,7 +1118,6 @@ def main():
         current_mode = mode
         spotify_trigger_time = 0
         spotify_exit_start_time = 0
-        last_sent = ""
         last_volume_level = None
         last_spotify_gesture = None
         spotify_launch_attempted = False
@@ -1104,9 +1126,6 @@ def main():
         spotify_last_action_time = 0.0
         spotify_wait_release = False
         print(f"Mode switched to {current_mode}")
-
-        if current_mode == "IOT":
-            send_arduino("G")
 
     def reply(text):
         nonlocal voice_last_command
@@ -1368,7 +1387,7 @@ def main():
                 return "Great to hear from you. Hope your day is going smoothly."
 
             if any(phrase in lowered_text for phrase in ["who are you", "what are you", "your name", "who is this"]):
-                return "I am JARVIS, your IoT and voice assistant."
+                return "I am JARVIS, your voice assistant."
 
             if any(phrase in lowered_text for phrase in ["what time", "current time", "time now"]):
                 return f"Current time is {now_dt.strftime('%I:%M %p')}"
@@ -1528,9 +1547,9 @@ def main():
             reply("JARVIS on")
             return
 
-        if "iot mode" in command or "go to iot" in command:
-            set_mode("IOT")
-            reply("I O T mode")
+        if "gesture mode" in command or "go to gesture" in command or "control mode" in command:
+            set_mode("GESTURE")
+            reply("Gesture mode")
             return
 
         if "spotify mode" in command or "go to spotify" in command:
@@ -1766,9 +1785,6 @@ def main():
     startup_checks = collect_startup_checks()
     startup_checks_last_refresh = time.time()
 
-    if current_mode == "IOT":
-        send_arduino("G")
-
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -1792,7 +1808,6 @@ def main():
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb_frame)
 
-        cmd = "0"
         gesture_name = "NONE"
         pinch_active = False
         jarvis_active = False
@@ -1823,7 +1838,7 @@ def main():
 
                 detected_count_all = count_raised_fingers(lm_all)
 
-                if current_mode == "IOT" and not voice_enabled and detected_count_all == 5:
+                if current_mode == "GESTURE" and not voice_enabled and detected_count_all == 5:
                     palm_points_all = [0, 1, 5, 9, 13, 17]
                     base_center_x_all = sum(lm_all[idx].x for idx in palm_points_all) / len(palm_points_all)
                     base_center_y_all = sum(lm_all[idx].y for idx in palm_points_all) / len(palm_points_all)
@@ -1888,7 +1903,7 @@ def main():
             dy = index_base[1] - palm_center[1]
             jarvis_angle = math.degrees(math.atan2(dy, dx)) + 90
 
-            if current_mode == "IOT" and not voice_enabled:
+            if current_mode == "GESTURE" and not voice_enabled:
                 if detected_count != 0 and must_release_fist_after_spotify:
                     must_release_fist_after_spotify = False
 
@@ -1910,7 +1925,7 @@ def main():
                     spotify_trigger_time = 0
                     spotify_launch_attempted = False
 
-                if current_mode == "IOT":
+                if current_mode == "GESTURE":
                     if detected_count == 0:
                         if must_release_fist_after_spotify:
                             gesture_name = "RELEASE FIST"
@@ -1935,13 +1950,11 @@ def main():
                                 pygame.mixer.stop()
                                 sys.exit()
                     elif pinch_detected:
-                        pinch_action = iot_action_for_detection(detected_count, True)
+                        pinch_action = gesture_mode_action_for_detection(detected_count, True)
                         if pinch_action:
                             gesture_name = pinch_action["label"]
-                            cmd = pinch_action["command"] or "P"
                         else:
                             gesture_name = "PINCH/SPARKLE"
-                            cmd = "P"
                         pinch_active = True
 
                         for _ in range(3):
@@ -1956,12 +1969,14 @@ def main():
                                 -1,
                             )
                     else:
-                        iot_action = iot_action_for_detection(detected_count, False)
-                        if iot_action:
-                            gesture_name = iot_action["label"]
-                            if iot_action["command"]:
-                                cmd = iot_action["command"]
-                            jarvis_active = bool(iot_action["jarvis"])
+                        gesture_action = gesture_mode_action_for_detection(detected_count, False)
+                        if gesture_action:
+                            gesture_name = gesture_action["label"]
+                            jarvis_active = bool(gesture_action["jarvis"])
+                            if gesture_action.get("screenshot"):
+                                saved_path = take_screenshot(frame)
+                                if saved_path:
+                                    gesture_name = "SCREENSHOT SAVED"
 
             if current_mode == "SPOTIFY" and not voice_enabled:
                 display_mode = current_mode
@@ -1974,14 +1989,14 @@ def main():
                         spotify_exit_start_time = time.time()
                     elapsed = time.time() - spotify_exit_start_time
                     switch_countdown = max(0.0, 3.0 - elapsed)
-                    gesture_name = "EXITING TO IOT"
+                    gesture_name = "EXITING TO GESTURE"
                     spotify_wait_release = False
                     spotify_pending_gesture = None
 
                     if elapsed >= 3.0:
                         must_release_fist_after_spotify = True
                         fist_start_time = 0
-                        set_mode("IOT")
+                        set_mode("GESTURE")
                         display_mode = current_mode
                         last_spotify_gesture = None
                         spotify_exit_start_time = 0
@@ -2024,8 +2039,11 @@ def main():
         else:
             spotify_trigger_time = 0
 
-        if current_mode == "IOT" and not voice_enabled:
+        if current_mode == "GESTURE" and not voice_enabled:
             jarvis_active = bool(jarvis_render_targets)
+
+        if screenshot_wait_release and detected_count != 2:
+            screenshot_wait_release = False
 
         if gesture_name != "FIST":
             fist_start_time = 0
@@ -2035,7 +2053,7 @@ def main():
             except Exception:
                 pass
 
-        if current_mode == "IOT" and jarvis_active and jarvis_render_targets:
+        if current_mode == "GESTURE" and jarvis_active and jarvis_render_targets:
             sorted_targets = sorted(jarvis_render_targets, key=lambda item: item[0][0])
 
             if len(sorted_targets) >= 2:
@@ -2422,13 +2440,10 @@ def main():
 
         last_pinch_state = pinch_detected
 
-        if current_mode == "IOT" and not voice_enabled:
-            send_arduino(cmd)
-
         canvas = cv2.subtract(canvas, (15, 15, 15, 0))
         frame = cv2.add(frame, canvas)
 
-        mode_color = (0, 255, 0) if current_mode == "IOT" else (0, 200, 255)
+        mode_color = (0, 255, 0) if current_mode == "GESTURE" else (0, 200, 255)
         color = (0, 255, 0) if gesture_name != "FIST" else (0, 0, 255)
 
         now = time.time()
@@ -2483,7 +2498,7 @@ def main():
         cv2.rectangle(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (88, 116, 170), 1)
         cv2.putText(frame, "SYSTEM CHECKS", (panel_x + 12, panel_y + 28), 1, 1.0, (240, 240, 255), 2)
 
-        check_items = ["MIC", "OLLAMA", "SPOTIFY", "ARDUINO"]
+        check_items = ["MIC", "OLLAMA", "SPOTIFY"]
         for index, key in enumerate(check_items):
             ok = bool(startup_checks.get(key))
             label = "OK" if ok else "MISSING"
@@ -2500,7 +2515,7 @@ def main():
         bottom_hint = "Press V: Voice Toggle   Esc: Exit"
         cv2.putText(frame, bottom_hint, (18, h - 22), 1, 0.8, (185, 200, 240), 2)
 
-        if switch_countdown is not None and current_mode == "IOT":
+        if switch_countdown is not None and current_mode == "GESTURE":
             cv2.putText(frame, "Switching...", (w // 2 - 170, h // 2 - 30), 1, 2.2, (0, 200, 255), 4)
             cv2.putText(
                 frame,
@@ -2512,11 +2527,11 @@ def main():
                 4,
             )
 
-        if fist_start_time > 0 and current_mode == "IOT":
+        if fist_start_time > 0 and current_mode == "GESTURE":
             cd = 3 - int(time.time() - fist_start_time)
             cv2.putText(frame, str(max(0, cd)), (w // 2 - 50, h // 2), 1, 12, (0, 0, 255), 15)
 
-        cv2.imshow("IoT Interface Final", frame)
+        cv2.imshow("JARVIS Interface", frame)
 
         key = cv2.waitKey(1) & 0xFF
 

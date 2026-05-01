@@ -1,1 +1,0 @@
-"""IoT gesture controller package."""

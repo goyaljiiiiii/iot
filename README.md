@@ -1,31 +1,29 @@
-# IoT Gesture Controller
+# Jarvis Gesture + Voice Controller
 
-Real-time hand gesture, voice, and Spotify control system for Linux-based IoT setups.
+Real-time hand gesture, voice, and Spotify control system for Linux.
 
 This project combines:
 
 - OpenCV + MediaPipe hand tracking
-- Arduino serial commands for IoT actions
 - Spotify playback control (Web API or local fallback)
 - Google Tasks CRUD by voice (create, list, update, complete, delete)
 - Optional wake-word voice assistant behavior
 
 ## Features
 
-- Gesture-to-command mapping for IoT and Spotify modes
-- Mode switching between `IOT` and `SPOTIFY`
+- Gesture-to-command mapping for gesture and Spotify modes
+- Mode switching between `GESTURE` and `SPOTIFY`
 - Optional voice command listener (toggle at runtime)
 - Wake-word support (`jarvis`) and chat-style assistant replies
-- Automatic startup checks overlay (mic, Ollama, Spotify, Arduino)
+- Automatic startup checks overlay (mic, Ollama, Spotify)
 - Safe fallback behavior when Spotify API credentials are not configured
 
 ## Project Structure
 
-- `iot_control/gesture.py`: Main camera loop, gesture recognition, mode logic, and voice orchestration
-- `iot_control/voice.py`: Background voice listener and wake-word flow
-- `iot_control/spotify.py`: Spotify auth and helper actions
+- `jarvis_control/gesture.py`: Main camera loop, gesture recognition, mode logic, and voice orchestration
+- `jarvis_control/voice.py`: Background voice listener and wake-word flow
+- `jarvis_control/spotify.py`: Spotify auth and helper actions
 - `scripts/run_gesture.py`: Launcher script
-- `scripts/serial_command_test.py`: Arduino serial command test utility
 - `audios/`: Local sound effects
 - `asset/`: Reserved static assets
 
@@ -35,7 +33,6 @@ This project combines:
 - Python 3.10+
 - Webcam
 - Microphone (for voice commands)
-- Optional Arduino on `/dev/ttyUSB*` or `/dev/ttyACM*`
 - Optional Spotify account/app
 
 ## Setup
@@ -67,7 +64,7 @@ This project combines:
 ## Run
 
 ```bash
-iot-gesture
+jarvis-gesture
 ```
 
 Or:
@@ -127,16 +124,6 @@ sudo apt install playerctl
 
 - Confirm webcam permissions.
 - Try setting `CAMERA_INDEX` in `.env`.
-
-### Arduino not detected
-
-- Check cable and board permissions.
-- Verify the device appears under `/dev/ttyUSB*` or `/dev/ttyACM*`.
-- Use:
-
-```bash
-python scripts/serial_command_test.py
-```
 
 ## Security
 

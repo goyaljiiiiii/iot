@@ -25,6 +25,6 @@ jobs:
 
       - name: Compile key modules
         run: |
-          python -m py_compile iot_control/gesture.py
-          python -m py_compile iot_control/voice.py
-          python -m py_compile iot_control/spotify.py
+          python -m py_compile jarvis_control/gesture.py
+          python -m py_compile jarvis_control/voice.py
+          python -m py_compile jarvis_control/spotify.py
