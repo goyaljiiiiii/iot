@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -1757,6 +1758,119 @@ def main():
             last_volume_level = level
             spotify_set_volume(level)
             reply(f"Volume {level} percent")
+            return
+
+        # ── Feature: Open app by voice ────────────────────────────────────
+        open_match = re.match(r"^open\s+(.+)$", command)
+        if open_match:
+            app_name = open_match.group(1).strip()
+            app_map = {
+                "chrome":      ["google-chrome", "chromium-browser", "chromium"],
+                "firefox":     ["firefox"],
+                "terminal":    ["gnome-terminal", "xterm", "konsole", "xfce4-terminal"],
+                "files":       ["nautilus", "thunar", "dolphin"],
+                "spotify":     ["spotify"],
+                "vscode":      ["code"],
+                "calculator":  ["gnome-calculator", "kcalc"],
+                "settings":    ["gnome-control-center", "systemsettings5"],
+            }
+            candidates = app_map.get(app_name)
+            if not candidates:
+                for key, cmds in app_map.items():
+                    if key in app_name or app_name in key:
+                        candidates = cmds
+                        break
+            if not candidates:
+                candidates = [app_name]
+            launched = False
+            for cmd in candidates:
+                if shutil.which(cmd):
+                    subprocess.Popen([cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    reply(f"Opening {app_name}")
+                    launched = True
+                    break
+            if not launched:
+                reply(f"Could not find {app_name} on this system")
+            return
+
+        # ── Feature: System info ──────────────────────────────────────────
+        if any(w in command for w in ["battery", "power level", "how much battery"]):
+            try:
+                capacity = Path("/sys/class/power_supply/BAT0/capacity").read_text().strip()
+                status = Path("/sys/class/power_supply/BAT0/status").read_text().strip()
+                reply(f"Battery is at {capacity} percent and {status.lower()}")
+            except Exception:
+                reply("Battery information is not available on this device")
+            return
+
+        if any(w in command for w in ["cpu usage", "cpu load", "processor usage"]):
+            try:
+                result = subprocess.run(["top", "-bn1"], capture_output=True, text=True, timeout=5)
+                for line in result.stdout.splitlines():
+                    if "Cpu(s)" in line or "%Cpu" in line:
+                        idle_match = re.search(r"(\d+\.?\d*)\s*(?:id|idle)", line)
+                        if idle_match:
+                            usage = round(100 - float(idle_match.group(1)), 1)
+                            reply(f"CPU usage is {usage} percent")
+                            return
+                reply("Could not read CPU usage")
+            except Exception:
+                reply("CPU information is not available")
+            return
+
+        if any(w in command for w in ["ram usage", "memory usage", "how much ram", "memory left"]):
+            try:
+                result = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=3)
+                for line in result.stdout.splitlines():
+                    if line.startswith("Mem:"):
+                        parts = line.split()
+                        total, used = int(parts[1]), int(parts[2])
+                        pct = round(used / total * 100)
+                        reply(f"RAM is {used} of {total} megabytes used, {pct} percent")
+                        return
+                reply("Could not read memory info")
+            except Exception:
+                reply("Memory information is not available")
+            return
+
+        # ── Feature: Voice timer ──────────────────────────────────────────
+        timer_match = re.search(
+            r"(?:set\s+)?timer\s+(?:for\s+)?(\d+)\s*(minute|minutes|second|seconds|min|sec|m|s)\b",
+            command,
+        )
+        if timer_match:
+            amount = int(timer_match.group(1))
+            unit = timer_match.group(2).lower()
+            seconds = amount * 60 if unit.startswith("m") else amount
+            label = f"{amount} {'minute' if unit.startswith('m') else 'second'}{'s' if amount != 1 else ''}"
+
+            def _timer(secs, lbl):
+                time.sleep(secs)
+                speak(f"Timer done. {lbl} is up.")
+
+            threading.Thread(target=_timer, args=(seconds, label), daemon=True).start()
+            reply(f"Timer set for {label}")
+            return
+
+        # ── Feature: Read clipboard ───────────────────────────────────────
+        if any(w in command for w in ["read clipboard", "what's in clipboard", "whats in clipboard", "show clipboard"]):
+            clipboard_tools = [
+                ["xclip", "-selection", "clipboard", "-o"],
+                ["xsel", "--clipboard", "--output"],
+            ]
+            for tool in clipboard_tools:
+                if shutil.which(tool[0]):
+                    try:
+                        result = subprocess.run(tool, capture_output=True, text=True, timeout=3)
+                        text_clip = result.stdout.strip()
+                        if text_clip:
+                            reply(f"Clipboard says: {text_clip[:120]}")
+                        else:
+                            reply("Clipboard is empty")
+                        return
+                    except Exception:
+                        pass
+            reply("Clipboard tool not found. Install xclip with: sudo apt install xclip")
             return
 
         reply(chat_reply(command))
