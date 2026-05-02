@@ -1,4 +1,3 @@
-curl -fsSL https://ollama.ai/install.sh | sh
 ## JARVIS — Beginner Guide (Gesture + Voice)
 
 Welcome! This repo teaches you how to build a simple JARVIS-style assistant using hand gestures, voice commands, and (optionally) Spotify control. The instructions below assume you are using Linux and have a webcam and microphone available.
@@ -20,6 +19,20 @@ python3 -m venv .venv
 . .venv/bin/activate
 ```
 
+Windows (PowerShell):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Windows (cmd.exe):
+
+```cmd
+python -m venv .venv
+.\.venv\Scripts\activate.bat
+```
+
 ### 3) Install Python dependencies
 
 ```bash
@@ -27,6 +40,28 @@ pip install -r requirements.txt
 ```
 
 If the install fails for `mediapipe` or other packages, follow the errors and install any missing system packages (example: `sudo apt install build-essential libatlas-base-dev`).
+
+Notes by OS:
+
+- Linux: you may need build tools and PortAudio for audio support:
+
+```bash
+sudo apt install build-essential libatlas-base-dev portaudio19-dev
+```
+
+- macOS (Intel / Apple Silicon): install Homebrew then:
+
+```bash
+brew install portaudio ffmpeg
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+```
+
+On Apple Silicon you may need to use Python from Homebrew or install universal2 wheels for some packages.
+
+- Windows: install "Build Tools for Visual Studio" (C++), then activate venv and run `pip install -r requirements.txt`.
+   If `sounddevice` or `mediapipe` fail, install prebuilt wheels or use `pipwin` for PortAudio where applicable.
 
 ### 4) Optional system packages (recommended)
 
