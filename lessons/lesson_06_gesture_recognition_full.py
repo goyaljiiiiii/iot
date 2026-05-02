@@ -33,8 +33,13 @@ try:
 except Exception:
     sd = None
 
-from jarvis_control.spotify import create_spotify_client
-from jarvis_control.voice import VoiceCommandListener
+# Add root directory to path for imports
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from spotify import create_spotify_client
+from voice import VoiceCommandListener
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -47,6 +52,7 @@ DEFAULT_PROFILE_CONFIG = {
         "default": {
             "display_name": "Default",
             "gesture_mode_gestures": {
+                "1": {"label": "OPEN BROWSER", "browser": True},
                 "pinch": {"label": "PINCH/SPARKLE"},
                 "2": {"label": "SCREENSHOT", "screenshot": True},
                 "5": {"label": "JARVIS", "jarvis": True},
@@ -411,6 +417,7 @@ def main():
     spotify_pending_since = 0.0
     spotify_last_action_time = 0.0
     spotify_wait_release = False
+    browser_wait_release = False
     SPOTIFY_HOLD_SECONDS = 0.35
     SPOTIFY_COOLDOWN_SECONDS = 0.85
     voice_enabled = False
@@ -655,6 +662,7 @@ def main():
         label = action.get("label")
         jarvis = bool(action.get("jarvis", False))
         screenshot = bool(action.get("screenshot", False))
+        browser = bool(action.get("browser", False))
 
         if not isinstance(label, str) or not label.strip():
             return None
@@ -663,6 +671,7 @@ def main():
             "label": label.strip(),
             "jarvis": jarvis,
             "screenshot": screenshot,
+            "browser": browser,
         }
 
     def spotify_action_for_count(detected_count_value):
@@ -1110,7 +1119,7 @@ def main():
 
     def set_mode(mode):
         nonlocal current_mode, spotify_trigger_time, spotify_exit_start_time, last_volume_level, last_spotify_gesture, spotify_launch_attempted
-        nonlocal spotify_pending_gesture, spotify_pending_since, spotify_last_action_time, spotify_wait_release
+        nonlocal spotify_pending_gesture, spotify_pending_since, spotify_last_action_time, spotify_wait_release, browser_wait_release
 
         if current_mode == mode:
             return
@@ -1125,6 +1134,7 @@ def main():
         spotify_pending_since = 0.0
         spotify_last_action_time = 0.0
         spotify_wait_release = False
+        browser_wait_release = False
         print(f"Mode switched to {current_mode}")
 
     def reply(text):
@@ -1927,6 +1937,7 @@ def main():
 
                 if current_mode == "GESTURE":
                     if detected_count == 0:
+                        browser_wait_release = False
                         if must_release_fist_after_spotify:
                             gesture_name = "RELEASE FIST"
                             fist_start_time = 0
@@ -1977,6 +1988,15 @@ def main():
                                 saved_path = take_screenshot(frame)
                                 if saved_path:
                                     gesture_name = "SCREENSHOT SAVED"
+                            if gesture_action.get("browser"):
+                                if not browser_wait_release:
+                                    subprocess.Popen(["xdg-open", "https://www.google.com"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    gesture_name = "BROWSER OPENED"
+                                    browser_wait_release = True
+                                else:
+                                    gesture_name = "OPEN BROWSER"
+                        else:
+                            browser_wait_release = False
 
             if current_mode == "SPOTIFY" and not voice_enabled:
                 display_mode = current_mode

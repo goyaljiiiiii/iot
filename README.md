@@ -1,65 +1,150 @@
-# Jarvis Gesture + Voice Controller
+curl -fsSL https://ollama.ai/install.sh | sh
+## JARVIS — Beginner Guide (Gesture + Voice)
 
-Real-time hand gesture, voice, and Spotify control system for Linux.
+Welcome! This repo teaches you how to build a simple JARVIS-style assistant using hand gestures, voice commands, and (optionally) Spotify control. The instructions below assume you are using Linux and have a webcam and microphone available.
 
-This project combines:
+If you cloned this repo from GitHub, replace the repository URL in the commands below with your repo's URL.
 
-- OpenCV + MediaPipe hand tracking
-- Spotify playback control (Web API or local fallback)
-- Google Tasks CRUD by voice (create, list, update, complete, delete)
-- Optional wake-word voice assistant behavior
+### 1) Clone repository
 
-## Features
+```bash
+# replace <your-repo-url> with the GitHub URL
+git clone <your-repo-url>
+cd Auto_bot_x
+```
 
-- Gesture-to-command mapping for gesture and Spotify modes
-- Mode switching between `GESTURE` and `SPOTIFY`
-- Optional voice command listener (toggle at runtime)
-- Wake-word support (`jarvis`) and chat-style assistant replies
-- Automatic startup checks overlay (mic, Ollama, Spotify)
-- Safe fallback behavior when Spotify API credentials are not configured
+### 2) Create Python virtual environment and activate
 
-## Project Structure
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+```
 
-- `jarvis_control/gesture.py`: Main camera loop, gesture recognition, mode logic, and voice orchestration
-- `jarvis_control/voice.py`: Background voice listener and wake-word flow
-- `jarvis_control/spotify.py`: Spotify auth and helper actions
-- `scripts/run_gesture.py`: Launcher script
-- `audios/`: Local sound effects
-- `asset/`: Reserved static assets
+### 3) Install Python dependencies
 
-## Requirements
+```bash
+pip install -r requirements.txt
+```
 
-- Linux
-- Python 3.10+
-- Webcam
-- Microphone (for voice commands)
-- Optional Spotify account/app
+If the install fails for `mediapipe` or other packages, follow the errors and install any missing system packages (example: `sudo apt install build-essential libatlas-base-dev`).
 
-## Setup
+### 4) Optional system packages (recommended)
 
-1. Create and activate a virtual environment.
-2. Install dependencies:
+```bash
+# Local media control fallback
+sudo apt install playerctl
 
-   ```bash
-   pip install -e .
-   ```
+# Text-to-speech (optional)
+sudo apt install speech-dispatcher espeak
+```
 
-3. Configure environment variables:
+### 5) Configure environment variables (optional — Spotify)
 
-   ```bash
-   cp .env.example .env
-   ```
+To enable Spotify Web API control, create a `.env` file in the project root with:
+
+```
+SPOTIFY_CLIENT_ID=your_client_id
+SPOTIFY_CLIENT_SECRET=your_client_secret
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
+```
+
+Create the Spotify app and add the redirect URI in the Spotify Developer Dashboard.
+
+### 6) What each file/folder is for
+
+- `gesture.py` — Main launcher that runs the full JARVIS app.
+- `lessons/` — Small, focused lesson scripts for teaching step-by-step.
+- `lessons/lesson_06_gesture_recognition_full.py` — Full app implementation (same as `gesture.py` behavior).
+- `spotify.py`, `voice.py` — Helpers for Spotify and voice recognition.
+- `audios/` — Sound effects used by the app.
+- `requirements.txt` — Python dependencies to install.
+
+### 7) Run the full JARVIS app
+
+```bash
+# Use CAMERA_INDEX to select the webcam if you have multiple
+CAMERA_INDEX=0 python gesture.py
+```
+
+Controls inside the app:
+- `V` — Toggle voice recognition on/off
+- `M` — Switch between GESTURE and SPOTIFY modes
+- `ESC` — Quit the application
+
+### 8) Run an individual lesson (recommended for beginners)
+
+Start with the camera lesson:
+
+```bash
+python lessons/lesson_01_open_camera.py
+```
+
+Then follow lessons in order:
+- `lesson_02_count_fingers.py` — MediaPipe hand detection and finger counting
+- `lesson_03_two_finger_screenshot.py` — Trigger screenshots with 2 fingers
+- `lesson_04_voice_control.py` — Voice listener demo
+- `lesson_05_spotify_integration.py` — Spotify API demo
+- `lesson_06_gesture_recognition_full.py` — Full system (same features as `gesture.py`)
+
+### 9) Gestures supported (quick reference)
+
+- `1 finger` — Open browser (one-time trigger)
+- `pinch` (thumb + index) — Sparkle effect (audio/visual)
+- `2 fingers` — Screenshot (saves to `screenshots/` by default)
+- `5 fingers` — Enter JARVIS mode
+
+In `SPOTIFY` mode (press `M`):
+- `1` — Play
+- `2` — Pause
+- `3` — Previous track
+- `4` — Next track
+
+### 10) Customizing gestures
+
+Open or create `profiles.json` in the project root to remap gestures or adjust settings. The default profile contains mappings for `gesture_mode_gestures` and `spotify_gestures`.
+
+### 11) Ignore screenshots folder in the repo
+
+This project keeps automatic screenshots locally. The repository is configured to ignore the `screenshots/` folder — no changes needed. (If you want to remove it from `.gitignore`, edit `.gitignore`.)
+
+### 12) Troubleshooting
+
+- If OpenCV windows are blank on Wayland, run:
+
+```bash
+export QT_QPA_PLATFORM=xcb
+python gesture.py
+```
+
+- If microphone input is not detected, run:
+
+```bash
+python -m sounddevice
+```
+
+- If Spotify API fails, ensure `.env` is configured and redirect URI matches your Spotify app settings.
+
+### 13) Contributing and classroom usage
+
+This repo is organized for teaching. For workshops we recommend:
+- Run lessons in order
+- Ask students to modify small parts (e.g., change gesture actions)
+- Use `lesson_06_gesture_recognition_full.py` as the final demo
+
+---
+
+If you want, I can also:
+- Add a short `CONTRIBUTING.md` tailored for student exercises
+- Add a minimal `profiles.json` example with comments
+- Create a `run.sh` helper script that sets up the venv and runs the app
+
+Happy teaching! 🎓
+
 
 4. If using Spotify API control, set:
    - `SPOTIFY_CLIENT_ID`
    - `SPOTIFY_CLIENT_SECRET`
    - `SPOTIFY_REDIRECT_URI` (must match your Spotify app config)
-
-5. If using Google Tasks voice CRUD, set OAuth vars:
-   - `GOOGLE_TASKS_CLIENT_ID`
-   - `GOOGLE_TASKS_CLIENT_SECRET`
-   - `GOOGLE_TASKS_REFRESH_TOKEN`
-   - Optional: `GOOGLE_TASK_LIST_ID` or `GOOGLE_TASK_LIST_NAME`
 
 ## Run
 
@@ -79,20 +164,11 @@ python scripts/run_gesture.py
 - Press `Esc` to exit.
 - When voice mode is on, gesture actions are paused to prevent accidental triggers.
 
-### Voice Examples (Google Tasks)
-
-- `add task buy milk`
-- `list my tasks`
-- `update task buy milk to buy almond milk`
-- `complete task buy almond milk`
-- `del task buy almond milk`
-
 ## Environment Variables
 
 See `.env.example` for all supported keys. Important ones:
 
 - Spotify API: `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REDIRECT_URI`
-- Google Tasks: `GOOGLE_TASKS_CLIENT_ID`, `GOOGLE_TASKS_CLIENT_SECRET`, `GOOGLE_TASKS_REFRESH_TOKEN`, `GOOGLE_TASK_LIST_ID`, `GOOGLE_TASK_LIST_NAME`, `GOOGLE_TASKS_ACCESS_TOKEN`
 - Cloud AI chat: `OPENAI_API_KEY` or `AI_CHAT_API_KEY`, `AI_CHAT_API_BASE`, `AI_CHAT_MODEL`
 - Local AI chat (Ollama): `AI_LOCAL_API_BASE`, `AI_LOCAL_MODEL`, `AI_AUTO_START_OLLAMA`
 - Camera selection: `CAMERA_INDEX` (example: `0` or `0,1`)

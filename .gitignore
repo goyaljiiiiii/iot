@@ -32,6 +32,9 @@ env/
 profiles.json
 asset/models/
 
+# Ignore screenshots saved during lessons/runs
+screenshots/
+
 # OS/editor files
 .DS_Store
 .vscode/

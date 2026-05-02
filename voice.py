@@ -1,3 +1,7 @@
+"""
+Voice recognition module. See lessons/lesson_04_voice_control.py for the educational version.
+"""
+
 import threading
 import time
 import re
